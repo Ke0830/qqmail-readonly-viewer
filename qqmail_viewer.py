@@ -15,6 +15,7 @@ import html
 import imaplib
 import json
 import re
+import ssl
 import subprocess
 import sys
 import time
@@ -194,7 +195,7 @@ def _security(args: list[str], *, input_text: str | None = None) -> str:
             check=False,
         )
     except FileNotFoundError as exc:
-        raise ViewerError("未找到 macOS 钥匙串工具 security。此查看器目前仅支持 macOS。") from exc
+        raise ViewerError("未找到 macOS 钥匙串工具 security，无法访问登录钥匙串。") from exc
     if result.returncode != 0:
         reason = result.stderr.strip() or "钥匙串操作失败"
         raise ViewerError(reason)
@@ -202,10 +203,7 @@ def _security(args: list[str], *, input_text: str | None = None) -> str:
 
 
 def _windows_credential_get(service: str) -> str:
-    try:
-        import keyring
-    except ImportError as exc:
-        raise ViewerError("缺少 Windows 凭据库依赖。请重新安装 qqmail-readonly-viewer。") from exc
+    keyring = _windows_keyring()
     try:
         value = keyring.get_password(service, KEYCHAIN_ACCOUNT)
     except Exception as exc:
@@ -216,17 +214,35 @@ def _windows_credential_get(service: str) -> str:
 
 
 def _windows_credential_set(service: str, value: str) -> None:
-    try:
-        import keyring
-    except ImportError as exc:
-        raise ViewerError("缺少 Windows 凭据库依赖。请重新安装 qqmail-readonly-viewer。") from exc
+    keyring = _windows_keyring()
     try:
         keyring.set_password(service, KEYCHAIN_ACCOUNT, value)
     except Exception as exc:
         raise ViewerError(f"无法写入 Windows 凭据管理器：{exc}") from exc
 
 
+def _windows_keyring():
+    try:
+        import keyring
+    except ImportError as exc:
+        raise ViewerError("缺少 Windows 凭据库依赖。请重新安装 qqmail-readonly-viewer。") from exc
+    backend = keyring.get_keyring()
+    if backend.__class__.__module__ != "keyring.backends.Windows":
+        backend_name = f"{backend.__class__.__module__}.{backend.__class__.__name__}"
+        raise ViewerError(
+            "为避免授权码被保存到非系统凭据库，Windows 只允许使用系统凭据管理器。"
+            f"当前 keyring 后端为 {backend_name}。"
+        )
+    return keyring
+
+
+def _ensure_supported_platform() -> None:
+    if sys.platform not in {"darwin", "win32"}:
+        raise ViewerError("当前系统不受支持。此查看器目前仅支持 macOS 和 Windows。")
+
+
 def keychain_get(service: str) -> str:
+    _ensure_supported_platform()
     if sys.platform == "win32":
         return _windows_credential_get(service)
     try:
@@ -236,6 +252,7 @@ def keychain_get(service: str) -> str:
 
 
 def keychain_set(service: str, value: str) -> None:
+    _ensure_supported_platform()
     if sys.platform == "win32":
         _windows_credential_set(service, value)
         return
@@ -261,7 +278,12 @@ class QQMailClient:
 
     def __enter__(self) -> "QQMailClient":
         try:
-            self.connection = imaplib.IMAP4_SSL(IMAP_HOST, IMAP_PORT, timeout=30)
+            self.connection = imaplib.IMAP4_SSL(
+                IMAP_HOST,
+                IMAP_PORT,
+                ssl_context=ssl.create_default_context(),
+                timeout=30,
+            )
             self.connection.login(self.address, self.authorization_code)
             status, _ = self.connection.select("INBOX", readonly=True)
             if status != "OK":
@@ -382,6 +404,7 @@ def configured_client() -> QQMailClient:
 
 
 def configure(address: str) -> None:
+    _ensure_supported_platform()
     address = address.strip().lower()
     if not re.fullmatch(r"[^@\s]+@(qq\.com|foxmail\.com)", address):
         raise ViewerError("请输入完整的 @qq.com 或 @foxmail.com 邮箱地址。")
@@ -418,7 +441,7 @@ def page(title: str, content: str) -> bytes:
 
 
 class ViewerHandler(BaseHTTPRequestHandler):
-    server_version = "QQMailViewer/1.0"
+    server_version = "QQMailViewer/1.1"
 
     def do_GET(self) -> None:  # noqa: N802
         route = urlparse(self.path)

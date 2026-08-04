@@ -1,13 +1,19 @@
 import email
+import ssl
+import sys
 import unittest
+import uuid
+from types import SimpleNamespace
 from datetime import datetime, timezone
 from email.utils import format_datetime
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
 from qqmail_viewer import (
     AUTH_SERVICE,
     EMAIL_SERVICE,
+    KEYCHAIN_ACCOUNT,
     QQMailClient,
+    ViewerError,
     build_parser,
     decode_bytes,
     decode_mime,
@@ -15,6 +21,9 @@ from qqmail_viewer import (
     keychain_get,
     keychain_set,
     normalize_date,
+    _windows_credential_get,
+    _windows_credential_set,
+    _windows_keyring,
 )
 
 
@@ -130,6 +139,42 @@ AA==
 
         get_credential.assert_called_once_with(EMAIL_SERVICE)
         set_credential.assert_called_once_with(AUTH_SERVICE, "authorization-code")
+
+    def test_imap_connection_verifies_certificate_and_hostname(self):
+        connection = MagicMock()
+        connection.select.return_value = ("OK", [b""])
+
+        with patch("qqmail_viewer.imaplib.IMAP4_SSL", return_value=connection) as constructor:
+            with QQMailClient("user@example.com", "authorization-code"):
+                pass
+
+        context = constructor.call_args.kwargs["ssl_context"]
+        self.assertEqual(context.verify_mode, ssl.CERT_REQUIRED)
+        self.assertTrue(context.check_hostname)
+
+    def test_rejects_non_windows_keyring_backend(self):
+        class UnsafeBackend:
+            pass
+
+        fake_keyring = SimpleNamespace(get_keyring=lambda: UnsafeBackend())
+        with patch.dict(sys.modules, {"keyring": fake_keyring}):
+            with self.assertRaisesRegex(ViewerError, "只允许使用系统凭据管理器"):
+                _windows_keyring()
+
+    @unittest.skipUnless(sys.platform == "win32", "requires Windows Credential Manager")
+    def test_windows_credential_manager_round_trip(self):
+        service = f"qqmail-readonly-viewer.test.{uuid.uuid4().hex}"
+        value = uuid.uuid4().hex
+        stored = False
+        try:
+            _windows_credential_set(service, value)
+            stored = True
+            self.assertEqual(_windows_credential_get(service), value)
+        finally:
+            if stored:
+                import keyring
+
+                keyring.delete_password(service, KEYCHAIN_ACCOUNT)
 
 
 if __name__ == "__main__":
