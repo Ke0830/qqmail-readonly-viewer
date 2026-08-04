@@ -49,20 +49,6 @@ py -m pip install .
 qqmail-viewer configure --email 你的号码@qq.com
 ```
 
-如果找不到 `qqmail-viewer` 命令，可以在仓库目录直接运行：
-
-macOS：
-
-```bash
-python3 qqmail_viewer.py configure --email 你的号码@qq.com
-```
-
-Windows PowerShell：
-
-```powershell
-py qqmail_viewer.py configure --email 你的号码@qq.com
-```
-
 终端会提示输入授权码，输入内容不会显示。授权码将保存在 macOS 登录钥匙串或 Windows 凭据管理器中，不会写入项目文件。
 
 ## 使用
