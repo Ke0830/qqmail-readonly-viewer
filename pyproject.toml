@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "qqmail-readonly-viewer"
-version = "1.1.0"
+version = "1.2.0"
 description = "A local, read-only multi-account IMAP mail viewer for macOS and Windows"
 readme = "README.md"
 requires-python = ">=3.10"

@@ -602,7 +602,7 @@ class QQMailClient:
             return
         try:
             self.connection.xatom(
-                "ID", '("name" "qqmail-readonly-viewer" "version" "1.1.0")'
+                "ID", '("name" "qqmail-readonly-viewer" "version" "1.2.0")'
             )
         except (imaplib.IMAP4.error, OSError):
             # Some older IMAP endpoints simply do not implement ID. EXAMINE
@@ -913,7 +913,7 @@ def page(title: str, content: str) -> bytes:
 
 
 class ViewerHandler(BaseHTTPRequestHandler):
-    server_version = "QQMailViewer/1.1"
+    server_version = "QQMailViewer/1.2.0"
 
     def do_GET(self) -> None:  # noqa: N802
         route = urlparse(self.path)
