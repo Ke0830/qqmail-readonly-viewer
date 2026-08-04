@@ -1,8 +1,9 @@
 #!/usr/bin/env python3
 """Local, read-only QQ Mail viewer.
 
-Credentials are stored in the macOS login keychain. Mail is fetched over IMAPS
-and BODY.PEEK is used so viewing a message does not mark it as read.
+Credentials are stored in the macOS login keychain or Windows Credential
+Locker. Mail is fetched over IMAPS and BODY.PEEK is used so viewing a message
+does not mark it as read.
 """
 
 from __future__ import annotations
@@ -200,7 +201,34 @@ def _security(args: list[str], *, input_text: str | None = None) -> str:
     return result.stdout.strip()
 
 
+def _windows_credential_get(service: str) -> str:
+    try:
+        import keyring
+    except ImportError as exc:
+        raise ViewerError("缺少 Windows 凭据库依赖。请重新安装 qqmail-readonly-viewer。") from exc
+    try:
+        value = keyring.get_password(service, KEYCHAIN_ACCOUNT)
+    except Exception as exc:
+        raise ViewerError(f"无法访问 Windows 凭据管理器：{exc}") from exc
+    if value is None:
+        raise ViewerError("尚未配置 QQ 邮箱。请先运行 configure。")
+    return value
+
+
+def _windows_credential_set(service: str, value: str) -> None:
+    try:
+        import keyring
+    except ImportError as exc:
+        raise ViewerError("缺少 Windows 凭据库依赖。请重新安装 qqmail-readonly-viewer。") from exc
+    try:
+        keyring.set_password(service, KEYCHAIN_ACCOUNT, value)
+    except Exception as exc:
+        raise ViewerError(f"无法写入 Windows 凭据管理器：{exc}") from exc
+
+
 def keychain_get(service: str) -> str:
+    if sys.platform == "win32":
+        return _windows_credential_get(service)
     try:
         return _security(["find-generic-password", "-a", KEYCHAIN_ACCOUNT, "-s", service, "-w"])
     except ViewerError as exc:
@@ -208,6 +236,9 @@ def keychain_get(service: str) -> str:
 
 
 def keychain_set(service: str, value: str) -> None:
+    if sys.platform == "win32":
+        _windows_credential_set(service, value)
+        return
     _security(
         [
             "add-generic-password",
@@ -362,7 +393,10 @@ def configure(address: str) -> None:
         pass
     keychain_set(EMAIL_SERVICE, address)
     keychain_set(AUTH_SERVICE, code)
-    print("配置成功。授权码已保存在 macOS 钥匙串中。")
+    if sys.platform == "win32":
+        print("配置成功。授权码已保存在 Windows 凭据管理器中。")
+    else:
+        print("配置成功。授权码已保存在 macOS 钥匙串中。")
 
 
 BASE_STYLE = """
@@ -500,7 +534,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="本地只读 QQ 邮箱查看器")
     sub = parser.add_subparsers(dest="command", required=True)
 
-    configure_parser = sub.add_parser("configure", help="测试连接并把授权信息保存到 macOS 钥匙串")
+    configure_parser = sub.add_parser("configure", help="测试连接并把授权信息保存到系统凭据库")
     configure_parser.add_argument("--email", required=True, help="完整的 QQ 或 Foxmail 邮箱地址")
 
     list_parser = sub.add_parser("list", help="以 JSON 列出邮件，供人工或定时任务读取")

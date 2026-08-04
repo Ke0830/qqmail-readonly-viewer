@@ -4,7 +4,18 @@ from datetime import datetime, timezone
 from email.utils import format_datetime
 from unittest.mock import patch
 
-from qqmail_viewer import QQMailClient, build_parser, decode_bytes, decode_mime, extract_message_text, normalize_date
+from qqmail_viewer import (
+    AUTH_SERVICE,
+    EMAIL_SERVICE,
+    QQMailClient,
+    build_parser,
+    decode_bytes,
+    decode_mime,
+    extract_message_text,
+    keychain_get,
+    keychain_set,
+    normalize_date,
+)
 
 
 class _FakeIMAP:
@@ -109,6 +120,16 @@ AA==
 
         self.assertEqual([message.subject for message in messages], ["newest", "still recent"])
         self.assertEqual([message.subject for message in second_page], ["still recent"])
+
+    def test_uses_windows_credential_backend_only_on_windows(self):
+        with patch("qqmail_viewer.sys.platform", "win32"), patch(
+            "qqmail_viewer._windows_credential_get", return_value="user@example.com"
+        ) as get_credential, patch("qqmail_viewer._windows_credential_set") as set_credential:
+            self.assertEqual(keychain_get(EMAIL_SERVICE), "user@example.com")
+            keychain_set(AUTH_SERVICE, "authorization-code")
+
+        get_credential.assert_called_once_with(EMAIL_SERVICE)
+        set_credential.assert_called_once_with(AUTH_SERVICE, "authorization-code")
 
 
 if __name__ == "__main__":
