@@ -1,0 +1,28 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "qqmail-readonly-viewer"
+version = "1.0.0"
+description = "A local, read-only QQ Mail viewer for macOS"
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "MIT" }
+authors = [{ name = "Ke0830" }]
+keywords = ["qqmail", "imap", "email", "macos", "readonly"]
+classifiers = [
+  "Development Status :: 4 - Beta",
+  "Environment :: MacOS X",
+  "License :: OSI Approved :: MIT License",
+  "Operating System :: MacOS",
+  "Programming Language :: Python :: 3",
+  "Programming Language :: Python :: 3 :: Only",
+  "Topic :: Communications :: Email :: Email Clients (MUA)",
+]
+
+[project.scripts]
+qqmail-viewer = "qqmail_viewer:main"
+
+[tool.setuptools]
+py-modules = ["qqmail_viewer"]
