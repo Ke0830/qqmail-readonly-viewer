@@ -50,6 +50,8 @@ qqmail-viewer configure --email 你的号码@qq.com --name qq
 qqmail-viewer configure --email name@gmail.com --name personal-gmail
 qqmail-viewer configure --provider icloud --email name@icloud.com --name icloud
 qqmail-viewer configure --provider 163 --email name@163.com --name netease
+
+其他邮箱格式以此类推
 ```
 
 不写 `--provider` 时会自动识别；若需要手动指定，也可以使用 `--provider qq`、`163`、`126`、`yeah`、`icloud` 或 `gmail`。第一个配置的账户会成为默认账户；之后添加账户时，可用 `--default` 更换命令行默认账户。
