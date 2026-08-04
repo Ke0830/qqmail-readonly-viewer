@@ -71,10 +71,11 @@ qqmail-viewer accounts
 ### 各服务商准备方式
 
 - **QQ / Foxmail**：登录 QQ 邮箱，进入“设置 → 账号与安全 → 安全设置”，开启 IMAP/SMTP 服务并生成授权码。
-- **163 / 126 / yeah**：登录对应网易邮箱，在客户端或 POP3/SMTP/IMAP 设置中开启 IMAP，生成“客户端授权密码”。
+- **163 / 126 / yeah**：登录对应邮箱网页版，点击设置，点击POP3/SMTP/IMAP，点击开启IMAP/SMTP服务生成授权码
 - **iCloud Mail**：在 Apple Account 的“登录与安全”中生成应用专用密码，然后用该密码配置；服务器为 `imap.mail.me.com:993`。详见 [Apple 官方说明](https://support.apple.com/en-us/102525)。
 - **Gmail**：先开启两步验证，再创建 Google 应用专用密码并用于配置。详见 [Google 应用专用密码说明](https://support.google.com/mail/answer/185833) 和 [Gmail IMAP 文档](https://developers.google.com/workspace/gmail/imap/imap-smtp)。
 
+[开启后返回](#添加账户)
 ## 使用
 
 启动网页：

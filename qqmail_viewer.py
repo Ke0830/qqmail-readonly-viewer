@@ -41,6 +41,7 @@ ACCOUNT_INDEX_SERVICE = "codex.qqmail-viewer.account-index.v2"
 DEFAULT_LIMIT = 30
 MAX_LIMIT = 100
 CHINA_TIMEZONE = timezone(timedelta(hours=8))
+NETEASE_IMAP_HOSTS = frozenset({"imap.163.com", "imap.126.com", "imap.yeah.net"})
 
 
 class ViewerError(RuntimeError):
@@ -575,9 +576,13 @@ class QQMailClient:
                 timeout=30,
             )
             self.connection.login(self.address, self.authorization_code)
-            status, _ = self.connection.select("INBOX", readonly=True)
+            self._identify_netease_client()
+            status, response = self.connection.select("INBOX", readonly=True)
             if status != "OK":
-                raise ViewerError("无法以只读方式打开收件箱。")
+                reason = _imap_response_text(response)
+                self.close()
+                suffix = f"服务器响应：{reason}" if reason else "请确认 IMAP 已开启并可访问收件箱。"
+                raise ViewerError(f"无法以只读方式打开收件箱。{suffix}")
             return self
         except imaplib.IMAP4.error as exc:
             self.close()
@@ -590,6 +595,19 @@ class QQMailClient:
         except OSError as exc:
             self.close()
             raise ViewerError(f"无法连接 {self.host}:{self.port}：{exc}") from exc
+
+    def _identify_netease_client(self) -> None:
+        """Send NetEase a harmless IMAP ID before its read-only mailbox check."""
+        if self.host not in NETEASE_IMAP_HOSTS or self.connection is None:
+            return
+        try:
+            self.connection.xatom(
+                "ID", '("name" "qqmail-readonly-viewer" "version" "1.1.0")'
+            )
+        except (imaplib.IMAP4.error, OSError):
+            # Some older IMAP endpoints simply do not implement ID. EXAMINE
+            # remains the authoritative read-only compatibility check.
+            pass
 
     def __exit__(self, exc_type: object, exc: object, tb: object) -> None:
         self.close()
@@ -709,6 +727,19 @@ def _extract_fetch_bytes(rows: Iterable[object]) -> tuple[bytes, bytes]:
             metadata += row[0] if isinstance(row[0], bytes) else b""
             payload += row[1] if isinstance(row[1], bytes) else b""
     return payload, metadata
+
+
+def _imap_response_text(rows: object) -> str:
+    """Turn a server response into a compact, safe-to-display diagnostic."""
+    if not isinstance(rows, (list, tuple)):
+        return ""
+    parts: list[str] = []
+    for row in rows:
+        if isinstance(row, bytes):
+            parts.append(decode_bytes(row))
+        elif isinstance(row, str):
+            parts.append(row)
+    return " ".join(" ".join(parts).split())[:300]
 
 
 def configured_client(account: Account | None = None) -> QQMailClient:
@@ -1013,7 +1044,7 @@ class ViewerHandler(BaseHTTPRequestHandler):
         selected_mode = "未读邮件" if params.unread_only else "全部邮件"
         listing = "".join(rows) if rows else '<div class="empty-state"><h2>这里没有符合条件的邮件</h2><p>你可以切换到全部邮件，或稍后刷新再试。</p></div>'
         account_options = "".join(
-            f'<option value="{html.escape(account.name, quote=True)}{" selected" if selection == account.name else ""}>{html.escape(account.name)} · {html.escape(account.email)}</option>'
+            f'<option value="{html.escape(account.name, quote=True)}"{" selected" if selection == account.name else ""}>{html.escape(account.name)} · {html.escape(account.email)}</option>'
             for account in accounts
         )
         if len(accounts) >= 2:

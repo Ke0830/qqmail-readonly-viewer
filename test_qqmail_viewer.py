@@ -323,6 +323,8 @@ AA==
 
         body = handler._send.call_args.args[0].decode("utf-8")
         self.assertIn("全部账户", body)
+        self.assertIn('<option value="qq">qq · a@qq.com</option>', body)
+        self.assertIn('<option value="gmail">gmail · b@gmail.com</option>', body)
         self.assertIn("gmail · b@gmail.com", body)
         self.assertIn("账户 qq 暂时无法读取", body)
         self.assertIn("account=gmail", body)
