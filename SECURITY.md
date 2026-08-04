@@ -22,4 +22,4 @@ The viewer never intentionally writes credentials to the repository. Users shoul
 
 ## Read-only connection boundary
 
-All built-in providers and custom accounts use TLS-protected IMAPS with certificate and hostname verification. Custom accounts cannot opt into plaintext IMAP. The viewer opens `INBOX` in read-only mode and uses `BODY.PEEK`; it does not send, delete, move, mark read, download attachments, or persist message bodies.
+All built-in providers and custom accounts use TLS-protected IMAPS with certificate and hostname verification. Custom accounts cannot opt into plaintext IMAP. The viewer opens `INBOX` in read-only mode and uses `BODY.PEEK`; it does not send, delete, move, mark read, or persist message bodies. Opening a message fetches the complete RFC message into memory, so attachment bytes may be transferred with it, but the viewer does not parse, expose, or save attachments.
