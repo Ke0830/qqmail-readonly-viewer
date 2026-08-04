@@ -127,7 +127,7 @@ Windows PowerShell：
 (Get-Command qqmail-viewer -ErrorAction Stop).Path
 ```
 
-现有 QQ 每日任务可继续使用默认命令，不需要改动。确认新增账户都能读取后，再将任务改为：
+建议给agent的每日任务命令：
 
 > 每天运行 `/查看器的绝对路径/qqmail-viewer list --all-accounts --unread --since-hours 24 --all-pages --include-text`，读取最近 24 小时内各账户的未读邮件并生成中文简报。
 >
