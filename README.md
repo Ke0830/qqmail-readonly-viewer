@@ -41,6 +41,7 @@ macOS 使用系统自带的 `security` 命令与登录钥匙串；Windows 使用
 ```bash
 git clone https://github.com/Ke0830/qqmail-readonly-viewer.git
 cd qqmail-readonly-viewer
+# 仅验证脚本可运行；此时还没有配置邮箱
 python3 qqmail_viewer.py --help
 ```
 
@@ -48,6 +49,7 @@ python3 qqmail_viewer.py --help
 
 ```bash
 python3 -m pip install .
+# 仅验证命令已安装；此时还没有配置邮箱
 qqmail-viewer --help
 ```
 
@@ -57,10 +59,13 @@ Windows 请在 PowerShell 中运行：
 git clone https://github.com/Ke0830/qqmail-readonly-viewer.git
 cd qqmail-readonly-viewer
 py -m pip install .
-qqmail-viewer --help
+# 仅验证脚本可运行；此时还没有配置邮箱
+py qqmail_viewer.py --help
 ```
 
-如果 Windows 找不到 `qqmail-viewer`，可先在仓库目录运行 `py qqmail_viewer.py --help`，或将 Python 的 `Scripts` 目录加入 `PATH` 后重新打开 PowerShell。
+`--help` 只显示帮助，不访问邮箱，因此配置前运行它是正常的。首次使用必须先完成下面的 `configure`；在此之前，`list`、`show` 和 `serve` 都会提示“尚未配置 QQ 邮箱”。
+
+Windows 中若找不到 `qqmail-viewer`，可直接在仓库目录使用 `py qqmail_viewer.py`，不必先修改 `PATH`。
 
 ## 首次配置
 
@@ -73,7 +78,11 @@ qqmail-viewer --help
 qqmail-viewer configure --email 你的号码@qq.com
 ```
 
-如果没有安装为命令，macOS 使用 `python3 qqmail_viewer.py`，Windows 使用 `py qqmail_viewer.py`。
+如果没有安装为命令，macOS 使用 `python3 qqmail_viewer.py`，Windows 使用 `py qqmail_viewer.py`。例如 Windows 首次配置可运行：
+
+```powershell
+py qqmail_viewer.py configure --email 你的号码@qq.com
+```
 
 终端会隐式读取授权码（输入时不显示字符）。程序先验证只读连接，成功后才把邮箱地址和授权码保存到系统凭据库：macOS 登录钥匙串或 Windows 凭据管理器。授权码不是 QQ 登录密码；不要把密码或授权码粘贴到聊天、Issue 或代码中。
 
@@ -166,15 +175,21 @@ qqmail-viewer list --unread --limit 5
 
 如果终端返回 JSON 格式的邮件列表，说明配置成功。该命令只读取邮件，不会将邮件标记为已读。
 
-如果没有安装命令行入口，也可以使用脚本的绝对路径：
+如果没有安装命令行入口，也可以使用脚本的绝对路径。macOS/Linux 示例：
 
 ```bash
 python3 /项目的绝对路径/qqmail_viewer.py list --unread --limit 5
 ```
 
+Windows PowerShell 示例：
+
+```powershell
+py C:\项目的绝对路径\qqmail_viewer.py list --unread --limit 5
+```
+
 ### 3. 确定 Agent 使用的命令路径
 
-运行：
+macOS/Linux 运行：
 
 ```bash
 command -v qqmail-viewer
@@ -186,6 +201,26 @@ command -v qqmail-viewer
 
 ```text
 /Users/你的用户名/.local/bin/qqmail-viewer
+```
+
+Windows PowerShell **不要**使用 `command -v`（这是 macOS/Linux 的命令）。若 `qqmail-viewer` 能直接运行，请使用：
+
+```powershell
+(Get-Command qqmail-viewer -ErrorAction Stop).Path
+```
+
+它会返回 `qqmail-viewer.exe` 的绝对路径。
+
+若这条命令报“找不到”，不表示安装失败；只表示 Python 的 `Scripts` 目录没有加入当前 `PATH`。此时推荐让 Agent 通过仓库脚本运行。先在仓库目录取得脚本绝对路径：
+
+```powershell
+(Resolve-Path .\qqmail_viewer.py).Path
+```
+
+然后把下面形式的命令提供给 Agent（将路径替换为上一条返回的结果）：
+
+```powershell
+py "C:\项目的绝对路径\qqmail_viewer.py" list --unread --since-hours 24 --all-pages --include-text
 ```
 
 ### 4. 给 Agent 的推荐指令
@@ -201,6 +236,10 @@ command -v qqmail-viewer
 > 只允许读取和分析邮件。不得发送、回复、删除、移动邮件，不得修改已读状态，也不得执行 `configure` 或索取邮箱密码、授权码。不要完整显示验证码、授权码、登录链接中的令牌或其他敏感内容；如需提及，只说明类型并脱敏。
 >
 > 如果命令执行失败，请判断并说明更可能是网络、系统凭据库还是 QQ 邮箱登录/授权问题，保留必要的非敏感错误信息；不要自行重新配置账号或修改系统凭据。
+
+Windows 未配置 `qqmail-viewer` 的 `PATH` 时，将上面第一行替换为：
+
+> `py "C:\项目的绝对路径\qqmail_viewer.py" list --unread --since-hours 24 --all-pages --include-text`
 
 ### 5. 定时任务示例
 
