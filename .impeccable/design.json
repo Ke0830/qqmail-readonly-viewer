@@ -1,0 +1,36 @@
+{
+  "schemaVersion": 2,
+  "generatedAt": "2026-08-04T22:32:00+08:00",
+  "title": "Design System: QQ 邮箱只读查看器",
+  "extensions": {
+    "colorMeta": {
+      "primary": {"role": "primary", "displayName": "石墨主操作", "canonical": "#282828", "tonalRamp": ["#171717", "#282828", "#414141", "#5d5d5d", "#858585", "#b5b5b5", "#d9d9d9", "#f3f3f3"]},
+      "dark-accent": {"role": "primary", "displayName": "石墨高光", "canonical": "#d9d9d9", "tonalRamp": ["#171717", "#282828", "#414141", "#5d5d5d", "#858585", "#b5b5b5", "#d9d9d9", "#f3f3f3"]},
+      "canvas": {"role": "neutral", "displayName": "白色工作台", "canonical": "#ffffff", "tonalRamp": ["#171717", "#282828", "#414141", "#5d5d5d", "#858585", "#b5b5b5", "#e6e6e6", "#ffffff"]},
+      "ink": {"role": "neutral", "displayName": "深灰文字", "canonical": "#242424", "tonalRamp": ["#171717", "#242424", "#3f3f3f", "#5f5f5f", "#858585", "#b5b5b5", "#dddddd", "#f7f7f7"]}
+    },
+    "typographyMeta": {
+      "headline": {"displayName": "紧凑标题", "purpose": "页面与邮件标题的阅读焦点。"},
+      "body": {"displayName": "系统正文", "purpose": "长期阅读和邮件内容。"},
+      "label": {"displayName": "紧凑标签", "purpose": "控件、状态与表头。"}
+    },
+    "shadows": [{"name": "content-surface", "value": "0 18px 42px rgba(31,49,77,.09)", "purpose": "用于完整列表和邮件阅读页。"}],
+    "motion": [{"name": "row-state", "value": "background .16s ease, box-shadow .16s ease", "purpose": "邮件行的轻量悬停反馈。"}],
+    "breakpoints": [{"name": "compact", "value": "780px"}]
+  },
+  "components": [
+    {"name": "Primary Button", "kind": "button", "refersTo": "button-primary", "description": "刷新等主要操作。", "html": "<button class=\"ds-primary\">刷新列表</button>", "css": ".ds-primary{min-height:35px;padding:0 11px;border:1px solid #282828;border-radius:8px;background:#282828;color:#fff;font:650 14px -apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;cursor:pointer}.ds-primary:hover{filter:brightness(1.14)}.ds-primary:focus-visible{outline:3px solid rgba(40,40,40,.38);outline-offset:2px}"},
+    {"name": "Secondary Button", "kind": "button", "refersTo": "button-secondary", "description": "分页与表单确认操作。", "html": "<button class=\"ds-secondary\">上一页</button>", "css": ".ds-secondary{min-height:35px;padding:0 11px;border:1px solid #d4d4d4;border-radius:8px;background:#fff;color:#242424;font:650 14px -apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;cursor:pointer}.ds-secondary:hover{border-color:#282828;color:#282828}.ds-secondary:focus-visible{outline:3px solid rgba(40,40,40,.38);outline-offset:2px}"},
+    {"name": "Filter Segment", "kind": "chip", "refersTo": "filter-segment", "description": "未读与全部邮件之间的切换。", "html": "<nav class=\"ds-segments\"><a>仅看未读</a><a class=\"active\">查看全部</a></nav>", "css": ".ds-segments{display:flex;padding:3px;border:1px solid #d7dfeb;border-radius:11px;background:#f8faff;font:650 14px -apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif}.ds-segments a{padding:7px 11px;color:#657187}.ds-segments .active{border-radius:8px;background:#fff;color:#172033;box-shadow:0 2px 7px rgba(30,44,67,.12)}"},
+    {"name": "Page Field", "kind": "input", "refersTo": "page-input", "description": "明确的一基页码跳转输入。", "html": "<input class=\"ds-page\" value=\"2\" aria-label=\"跳至页码\">", "css": ".ds-page{width:52px;height:35px;padding:0 9px;border:1px solid #bcc9da;border-radius:8px;background:#fff;color:#172033;text-align:center;font:400 15px -apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif}.ds-page:focus{outline:3px solid rgba(23,105,224,.55);outline-offset:1px}"},
+    {"name": "Mail Row", "kind": "custom", "refersTo": "mail-row", "description": "收件箱的高密度可点击内容行。", "html": "<a class=\"ds-row\"><span><b>示例发件人</b><small>sender@example.com</small></span><strong>邮件主题是主视觉</strong><time>2026-08-04 09:31</time></a>", "css": ".ds-row{display:grid;grid-template-columns:1fr 1.8fr auto;gap:24px;align-items:center;padding:13px 20px;border-bottom:1px solid #d7dfeb;background:#fff;color:#172033;text-decoration:none;font:400 15px -apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif}.ds-row:hover{background:#f2f7ff}.ds-row:focus-visible{outline:3px solid rgba(23,105,224,.55);outline-offset:-3px}.ds-row b,.ds-row small{display:block}.ds-row small,.ds-row time{color:#657187;font-size:13px}.ds-row strong{font-weight:700}.ds-row time{white-space:nowrap;text-align:right}"}
+  ],
+  "narrative": {
+    "northStar": "清晰的收件箱工作台",
+    "overview": "这是一个用于个人收件箱扫读的操作界面。页面优先让用户看清当前筛选、总数、所在页码和下一步操作，以克制的层次降低大量邮件带来的压力。",
+    "keyCharacteristics": ["高密度三列邮件列表，主题始终是主视觉。", "筛选、页码和范围在首屏即可理解。", "浅深色拥有各自完整的表面、边界和文字层级。", "仅通过状态、边线和有限阴影建立层级。"],
+    "rules": [{"name": "The One Accent Rule", "body": "蓝色只表示已选中或最主要的下一步；不要把它扩展成大面积装饰色。", "section": "colors"}],
+    "dos": ["Do 在列表首屏同时显示筛选、总数、显示范围和当前页。", "Do 让所有详情页返回到用户打开前的筛选与分页位置。", "Do 在浅色和深色模式中分别验证次级文字与边界的可读性。"],
+    "donts": ["Don't 用静态按钮代替真实的每页数量选择。", "Don't 在无下一页或无上一页时保留假装可点击的链接。", "Don't 以卡片、图标或装饰性渐变取代邮件内容本身的信息层级。"]
+  }
+}

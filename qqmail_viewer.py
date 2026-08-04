@@ -23,12 +23,12 @@ from dataclasses import asdict, dataclass
 from email.header import Header, decode_header
 from email.message import Message
 from datetime import timedelta, timezone
-from email.utils import parsedate_to_datetime
+from email.utils import parseaddr, parsedate_to_datetime
 from html.parser import HTMLParser
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Iterable
-from urllib.parse import parse_qs, urlparse
+from urllib.parse import parse_qs, urlencode, urlparse
 
 
 IMAP_HOST = "imap.qq.com"
@@ -104,6 +104,76 @@ class MailDetail:
     date: str
     text: str
     attachments: tuple[str, ...]
+
+
+@dataclass(frozen=True)
+class MailPage:
+    """A positioned slice of the currently selected mailbox view."""
+
+    messages: tuple[MailSummary, ...]
+    total: int
+    offset: int
+    limit: int
+
+    @property
+    def page_count(self) -> int:
+        return (self.total + self.limit - 1) // self.limit if self.total else 0
+
+    @property
+    def current_page(self) -> int:
+        return self.offset // self.limit + 1 if self.total else 0
+
+
+@dataclass(frozen=True)
+class ListingParams:
+    """Normalized list-view parameters from a browser query string."""
+
+    unread_only: bool
+    limit: int
+    offset: int
+    requested_page: int
+    invalid_page: bool = False
+
+
+def parse_listing_params(query: dict[str, list[str]]) -> ListingParams:
+    """Accept new page URLs while keeping existing offset URLs usable."""
+    unread_only = query.get("unread", ["1"])[0] != "0"
+    try:
+        limit = min(max(int(query.get("limit", [str(DEFAULT_LIMIT)])[0]), 1), MAX_LIMIT)
+    except ValueError:
+        limit = DEFAULT_LIMIT
+
+    page_value = query.get("page", [None])[0]
+    if page_value is not None:
+        try:
+            requested_page = int(page_value)
+        except ValueError:
+            requested_page = 1
+            return ListingParams(unread_only, limit, 0, requested_page, invalid_page=True)
+        if requested_page < 1:
+            return ListingParams(unread_only, limit, 0, 1, invalid_page=True)
+        return ListingParams(unread_only, limit, (requested_page - 1) * limit, requested_page)
+
+    try:
+        offset = max(int(query.get("offset", ["0"])[0]), 0)
+    except ValueError:
+        offset = 0
+    return ListingParams(unread_only, limit, offset, offset // limit + 1)
+
+
+def listing_url(unread_only: bool, limit: int, offset: int) -> str:
+    """Build the canonical, one-based page URL used by the web interface."""
+    page_number = offset // limit + 1
+    query = urlencode({"unread": "1" if unread_only else "0", "limit": limit, "page": page_number})
+    return f"/?{query}"
+
+
+def sender_parts(sender: str) -> tuple[str, str]:
+    """Split a decoded From header into a readable name and address."""
+    name, address = parseaddr(sender)
+    if address:
+        return (name or address, address if name else "")
+    return (sender or "（未知发件人）", "")
 
 
 def decode_bytes(payload: bytes, declared_charset: str | None = None) -> str:
@@ -325,12 +395,10 @@ class QQMailClient:
             raise ViewerError("邮箱连接尚未建立。")
         return self.connection
 
-    def list_messages(
+    def _matching_messages(
         self,
         *,
         unread_only: bool,
-        limit: int | None,
-        offset: int = 0,
         since_hours: float | None = None,
     ) -> list[MailSummary]:
         criteria = "UNSEEN" if unread_only else "ALL"
@@ -376,8 +444,27 @@ class QQMailClient:
         if since_hours is not None:
             cutoff = time.time() - since_hours * 60 * 60
             dated_messages = [item for item in dated_messages if item[0] >= cutoff]
+        return [item[2] for item in dated_messages]
+
+    def list_messages(
+        self,
+        *,
+        unread_only: bool,
+        limit: int | None,
+        offset: int = 0,
+        since_hours: float | None = None,
+    ) -> list[MailSummary]:
+        messages = self._matching_messages(unread_only=unread_only, since_hours=since_hours)
         end = offset + limit if limit is not None else None
-        return [item[2] for item in dated_messages[offset:end]]
+        return messages[offset:end]
+
+    def list_page(self, *, unread_only: bool, limit: int, offset: int = 0) -> MailPage:
+        """Return a browser page and its total, without fetching message bodies."""
+        messages = self._matching_messages(unread_only=unread_only)
+        total = len(messages)
+        last_offset = ((total - 1) // limit) * limit if total else 0
+        effective_offset = min(max(offset, 0), last_offset)
+        return MailPage(tuple(messages[effective_offset : effective_offset + limit]), total, effective_offset, limit)
 
     def get_message(self, uid: str) -> MailDetail:
         if not uid.isdigit():
@@ -435,15 +522,10 @@ def configure(address: str) -> None:
 
 
 BASE_STYLE = """
-:root{color-scheme:light dark;--bg:#f4f7fb;--card:#fff;--ink:#172033;--muted:#687386;--line:#dce3ed;--accent:#1769e0}
-@media(prefers-color-scheme:dark){:root{--bg:#10141b;--card:#171d27;--ink:#edf3ff;--muted:#9aa7ba;--line:#2b3545;--accent:#72a7ff}}
-*{box-sizing:border-box}body{margin:0;background:var(--bg);color:var(--ink);font:15px/1.55 -apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif}
-main{max-width:980px;margin:0 auto;padding:34px 22px 70px}header{display:flex;justify-content:space-between;align-items:end;gap:18px;margin-bottom:22px}
-h1{font-size:28px;margin:0}h2{font-size:21px;margin:0 0 12px}.muted{color:var(--muted)}.card{background:var(--card);border:1px solid var(--line);border-radius:16px;overflow:hidden;box-shadow:0 8px 28px rgba(20,34,58,.06)}
-.toolbar{display:flex;gap:9px;flex-wrap:wrap}.button{display:inline-block;padding:8px 12px;border-radius:9px;border:1px solid var(--line);color:var(--ink);text-decoration:none;background:var(--card)}.button.primary{background:var(--accent);border-color:var(--accent);color:#fff}
-.mail{display:grid;grid-template-columns:minmax(220px,1.2fr) minmax(0,2fr) auto;gap:16px;padding:15px 18px;border-top:1px solid var(--line);text-decoration:none;color:inherit;align-items:center}.mail:first-child{border-top:0}.mail:hover{background:color-mix(in srgb,var(--accent) 7%,var(--card))}.subject{font-weight:650;overflow-wrap:anywhere}.sender{color:var(--muted);overflow-wrap:anywhere}.date{color:var(--muted);white-space:nowrap}
-.message{padding:24px}.meta{display:grid;grid-template-columns:76px 1fr;gap:6px 12px;padding-bottom:20px;border-bottom:1px solid var(--line);margin-bottom:20px}.body{white-space:pre-wrap;overflow-wrap:anywhere;font:15px/1.7 ui-monospace,SFMono-Regular,Menlo,monospace}.attachments{padding:12px 14px;background:var(--bg);border-radius:10px;margin:14px 0}.empty{padding:55px 20px;text-align:center;color:var(--muted)}
-@media(max-width:700px){header{display:block}.toolbar{margin-top:14px}.mail{grid-template-columns:1fr}.date{font-size:13px}}
+:root{color-scheme:light dark;--canvas:#fff;--surface:#fff;--surface-raised:#f5f5f5;--ink:#242424;--muted:#6b6b6b;--quiet:#969696;--line:#e6e6e6;--line-strong:#d4d4d4;--accent:#282828;--accent-ink:#fff;--accent-wash:#ededed;--danger:#9b2d30;--danger-wash:#fff2f2;--shadow:0 18px 42px rgba(0,0,0,.06)}
+@media(prefers-color-scheme:dark){:root{--canvas:#191919;--surface:#202020;--surface-raised:#292929;--ink:#f2f2f2;--muted:#b5b5b5;--quiet:#858585;--line:#343434;--line-strong:#4a4a4a;--accent:#d9d9d9;--accent-ink:#1b1b1b;--accent-wash:#303030;--danger:#ffb6b6;--danger-wash:#392126;--shadow:0 18px 42px rgba(0,0,0,.24)}}
+*{box-sizing:border-box}body{margin:0;background:var(--canvas);color:var(--ink);font:15px/1.55 -apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif}button,input,select{font:inherit}a{color:inherit}main{max-width:1160px;margin:0 auto;padding:48px 26px 76px}h1,h2,p{margin:0}.app-header{display:flex;align-items:flex-end;justify-content:space-between;gap:28px;padding-bottom:26px;border-bottom:1px solid var(--line)}h1{font-size:clamp(26px,4vw,34px);line-height:1.12;letter-spacing:-.025em}.account{margin-top:8px;color:var(--muted);overflow-wrap:anywhere}.mailbox-state{display:flex;flex-wrap:wrap;gap:8px;margin-top:16px}.state-chip{padding:4px 9px;border-radius:999px;background:var(--accent-wash);color:var(--accent);font-size:13px;font-weight:700}.state-text{padding:4px 0;color:var(--muted);font-size:13px}.control-bar{display:flex;align-items:center;justify-content:space-between;gap:16px;padding:18px 0}.filter-group,.page-size-form,.pagination,.jump-form{display:flex;align-items:center;gap:8px;flex-wrap:wrap}.segmented{display:flex;padding:3px;border:1px solid var(--line);border-radius:11px;background:var(--surface-raised)}.segment{padding:7px 11px;border-radius:8px;text-decoration:none;color:var(--muted);font-size:14px;font-weight:650}.segment[aria-current="page"]{background:var(--surface);box-shadow:0 2px 7px rgba(30,44,67,.12);color:var(--ink)}.field-label{color:var(--muted);font-size:13px;font-weight:650}.select,.page-input{height:35px;border:1px solid var(--line-strong);border-radius:8px;background:var(--surface);color:var(--ink);padding:0 9px}.page-input{width:52px;text-align:center}.button,.page-link{min-height:35px;display:inline-flex;align-items:center;justify-content:center;padding:0 11px;border:1px solid var(--line-strong);border-radius:8px;background:var(--surface);color:var(--ink);text-decoration:none;cursor:pointer;font-weight:650;font-size:14px}.button.primary{background:var(--accent);border-color:var(--accent);color:var(--accent-ink)}.button:hover,.page-link:hover{border-color:var(--accent);color:var(--accent)}.button.primary:hover{filter:brightness(1.06);color:var(--accent-ink)}.page-link.disabled{border-color:var(--line);background:var(--surface-raised);color:var(--quiet);cursor:default}.pagination{justify-content:space-between;padding:15px 0}.page-controls{display:flex;align-items:center;gap:7px;flex-wrap:wrap}.page-status{color:var(--muted);font-size:14px;font-weight:650}.mailbox{border-top:1px solid var(--line);border-bottom:1px solid var(--line);background:var(--surface);box-shadow:var(--shadow)}.list-head,.mail{display:grid;grid-template-columns:minmax(220px,1.12fr) minmax(280px,1.85fr) 148px;gap:24px;align-items:center}.list-head{padding:10px 20px;background:var(--surface-raised);border-bottom:1px solid var(--line);color:var(--muted);font-size:12px;font-weight:750;letter-spacing:.04em}.mail{min-height:72px;padding:13px 20px;border-bottom:1px solid var(--line);text-decoration:none;position:relative;transition:background .16s ease,box-shadow .16s ease}.mail:last-child{border-bottom:0}.mail:hover{background:color-mix(in srgb,var(--accent) 6%,var(--surface))}.mail:focus-visible{outline:3px solid color-mix(in srgb,var(--accent) 55%,transparent);outline-offset:-3px;z-index:1}.sender-name{display:block;color:var(--ink);font-weight:650;overflow-wrap:anywhere}.sender-address{display:block;margin-top:2px;color:var(--muted);font-size:13px;overflow-wrap:anywhere}.subject{font-weight:700;overflow-wrap:anywhere;line-height:1.4}.date{color:var(--muted);font-variant-numeric:tabular-nums;white-space:nowrap;text-align:right}.empty-state,.error-state{padding:64px 24px;text-align:center;background:var(--surface)}.empty-state h2,.error-state h2{font-size:20px}.empty-state p,.error-state p{max-width:48ch;margin:8px auto 0;color:var(--muted)}.notice{margin:0 0 14px;padding:10px 13px;border:1px solid var(--line-strong);background:var(--surface-raised);color:var(--muted);font-size:14px}.detail-header{display:flex;align-items:flex-start;justify-content:space-between;gap:24px;padding-bottom:22px;border-bottom:1px solid var(--line)}.detail-subject{max-width:800px;font-size:clamp(24px,3.6vw,32px);overflow-wrap:anywhere}.read-only-note{margin-top:8px;color:var(--muted)}.message-shell{max-width:930px;margin-top:28px;background:var(--surface);box-shadow:var(--shadow)}.message-meta{display:grid;grid-template-columns:90px minmax(0,1fr);gap:10px 22px;padding:24px;border-bottom:1px solid var(--line)}.message-meta dt{color:var(--muted);font-weight:650}.message-meta dd{margin:0;overflow-wrap:anywhere}.attachments{margin:20px 24px 0;padding:13px 15px;border:1px solid var(--line);background:var(--surface-raised)}.attachment-label{font-weight:750}.body{padding:28px 24px 34px;white-space:pre-wrap;overflow-wrap:anywhere;font:15px/1.78 ui-monospace,SFMono-Regular,Menlo,monospace}.error-state{max-width:700px;margin:72px auto;box-shadow:var(--shadow)}.error-state h2{color:var(--danger)}.error-state .button{margin-top:20px}
+@media(max-width:780px){main{padding:28px 16px 52px}.app-header,.detail-header{display:block}.control-bar{align-items:flex-start;flex-direction:column}.pagination{align-items:flex-start;flex-direction:column}.list-head{display:none}.mail{grid-template-columns:minmax(0,1fr);gap:5px;padding:15px 16px}.subject{grid-column:1;grid-row:1}.mail .sender{grid-column:1;grid-row:2}.date{grid-column:1;grid-row:3;margin-top:2px;text-align:left;white-space:normal;font-size:13px}.sender-name{font-size:14px}.sender-address{max-width:100%;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}.message-shell{margin-top:22px}.message-meta{grid-template-columns:1fr;gap:2px;padding:20px}.message-meta dt:not(:first-child){margin-top:12px}.body{padding:24px 20px}.jump-form{width:100%}.page-input{width:64px}}
 """
 
 
@@ -465,63 +547,155 @@ class ViewerHandler(BaseHTTPRequestHandler):
             elif route.path == "/api/messages":
                 self._api_messages(parse_qs(route.query))
             else:
-                self._send(page("未找到", '<div class="card empty">页面不存在。</div>'), HTTPStatus.NOT_FOUND)
+                self._send(
+                    page(
+                        "未找到",
+                        '<section class="error-state"><h2>页面不存在</h2><p>请从邮箱列表重新开始。</p><a class="button primary" href="/">返回邮箱列表</a></section>',
+                    ),
+                    HTTPStatus.NOT_FOUND,
+                )
         except ViewerError as exc:
-            content = f'<header><h1>QQ 邮箱查看器</h1></header><div class="card empty">{html.escape(str(exc))}</div>'
+            retry_path = route.path or "/"
+            if route.query:
+                retry_path = f"{retry_path}?{route.query}"
+            content = f'''<section class="error-state"><h2>暂时无法读取邮箱</h2><p>{html.escape(str(exc))}</p><a class="button primary" href="{html.escape(retry_path, quote=True)}">重新尝试</a></section>'''
             self._send(page("发生错误", content), HTTPStatus.BAD_GATEWAY)
 
-    def _params(self, query: dict[str, list[str]]) -> tuple[bool, int, int]:
-        unread = query.get("unread", ["1"])[0] != "0"
-        try:
-            limit = min(max(int(query.get("limit", [str(DEFAULT_LIMIT)])[0]), 1), MAX_LIMIT)
-        except ValueError:
-            limit = DEFAULT_LIMIT
-        try:
-            offset = max(int(query.get("offset", ["0"])[0]), 0)
-        except ValueError:
-            offset = 0
-        return unread, limit, offset
+    @staticmethod
+    def _page_link(label: str, *, href: str | None) -> str:
+        if href is None:
+            return f'<span class="page-link disabled" aria-disabled="true">{label}</span>'
+        return f'<a class="page-link" href="{html.escape(href, quote=True)}">{label}</a>'
+
+    def _pagination(self, page_data: MailPage, params: ListingParams) -> str:
+        if not page_data.total:
+            return '<nav class="pagination" aria-label="邮件分页"><span class="page-status">没有可分页的邮件</span></nav>'
+
+        current = page_data.current_page
+        total_pages = page_data.page_count
+        first_url = listing_url(params.unread_only, params.limit, 0)
+        previous_url = listing_url(params.unread_only, params.limit, page_data.offset - params.limit) if current > 1 else None
+        next_url = listing_url(params.unread_only, params.limit, page_data.offset + params.limit) if current < total_pages else None
+        last_url = listing_url(params.unread_only, params.limit, (total_pages - 1) * params.limit)
+        return f'''<nav class="pagination" aria-label="邮件分页">
+  <span class="page-status">第 {current} / {total_pages} 页</span>
+  <div class="page-controls">
+    {self._page_link("首页", href=first_url if current > 1 else None)}
+    {self._page_link("上一页", href=previous_url)}
+    <form class="jump-form" method="get" action="/">
+      <input type="hidden" name="unread" value="{"1" if params.unread_only else "0"}">
+      <input type="hidden" name="limit" value="{params.limit}">
+      <label class="field-label" for="page-input-{current}">跳至</label>
+      <input class="page-input" id="page-input-{current}" name="page" type="number" min="1" max="{total_pages}" value="{current}" inputmode="numeric">
+      <button class="button" type="submit">前往</button>
+    </form>
+    {self._page_link("下一页", href=next_url)}
+    {self._page_link("末页", href=last_url if current < total_pages else None)}
+  </div>
+</nav>'''
+
+    @staticmethod
+    def _message_url(item: MailSummary, params: ListingParams, offset: int) -> str:
+        query = urlencode(
+            {
+                "uid": item.uid,
+                "unread": "1" if params.unread_only else "0",
+                "limit": params.limit,
+                "page": offset // params.limit + 1,
+            }
+        )
+        return f"/message?{query}"
 
     def _home(self, query: dict[str, list[str]]) -> None:
-        unread, limit, offset = self._params(query)
+        params = parse_listing_params(query)
         address = keychain_get(EMAIL_SERVICE)
         with configured_client() as client:
-            messages = client.list_messages(unread_only=unread, limit=limit, offset=offset)
-        rows = []
-        for item in messages:
-            rows.append(
-                f'<a class="mail" href="/message?uid={item.uid}"><span class="sender">{html.escape(item.sender)}</span><span class="subject">{html.escape(item.subject)}</span><time class="date">{html.escape(item.date)}</time></a>'
+            page_data = client.list_page(
+                unread_only=params.unread_only, limit=params.limit, offset=params.offset
             )
-        listing = "".join(rows) if rows else '<div class="empty">这里暂时没有符合条件的邮件。</div>'
-        opposite = "0" if unread else "1"
-        label = "查看全部" if unread else "仅看未读"
-        mode_value = "1" if unread else "0"
-        previous = ""
-        if offset > 0:
-            previous_offset = max(0, offset - limit)
-            previous = f'<a class="button" href="/?unread={mode_value}&limit={limit}&offset={previous_offset}">上一页</a>'
-        next_link = ""
-        if len(messages) == limit:
-            next_link = f'<a class="button" href="/?unread={mode_value}&limit={limit}&offset={offset + limit}">下一页</a>'
-        range_text = f"第 {offset + 1}–{offset + len(messages)} 封" if messages else "没有邮件"
-        content = f"""<header><div><h1>QQ 邮箱查看器</h1><div class="muted">{html.escape(address)} · 按日期倒序 · {range_text}</div></div><nav class="toolbar"><a class="button" href="/?unread={opposite}&limit={limit}&offset=0">{label}</a><a class="button" href="/?unread={mode_value}&limit=100&offset=0">每页 100 封</a>{previous}{next_link}<a class="button primary" href="/?unread={mode_value}&limit={limit}&offset={offset}">刷新</a></nav></header><section class="card">{listing}</section>"""
+        rows = []
+        for item in page_data.messages:
+            sender_name, sender_address = sender_parts(item.sender)
+            rows.append(
+                f'''<a class="mail" href="{html.escape(self._message_url(item, params, page_data.offset), quote=True)}">
+  <span class="sender"><span class="sender-name">{html.escape(sender_name)}</span>{f'<span class="sender-address">{html.escape(sender_address)}</span>' if sender_address else ''}</span>
+  <span class="subject">{html.escape(item.subject)}</span><time class="date">{html.escape(item.date)}</time>
+</a>'''
+            )
+        if page_data.total:
+            range_text = f"显示第 {page_data.offset + 1}–{page_data.offset + len(page_data.messages)} 封"
+            page_text = f"第 {page_data.current_page} / {page_data.page_count} 页"
+        else:
+            range_text = "没有符合当前筛选的邮件"
+            page_text = "没有可分页的邮件"
+        notice = ""
+        if params.invalid_page:
+            notice = '<p class="notice" role="status">页码必须是大于 0 的整数，已显示可用页面。</p>'
+        elif page_data.total and page_data.offset != params.offset:
+            notice = f'<p class="notice" role="status">第 {params.requested_page} 页不存在，已显示最后一页。</p>'
+        unread_url = listing_url(True, params.limit, 0)
+        all_url = listing_url(False, params.limit, 0)
+        selected_mode = "未读邮件" if params.unread_only else "全部邮件"
+        listing = "".join(rows) if rows else '<div class="empty-state"><h2>这里没有符合条件的邮件</h2><p>你可以切换到全部邮件，或稍后刷新再试。</p></div>'
+        content = f'''<header class="app-header">
+  <div>
+    <h1>QQ 邮箱查看器</h1>
+    <p class="account">{html.escape(address)} · 按日期倒序</p>
+    <div class="mailbox-state"><span class="state-chip">{selected_mode}</span><span class="state-text">共 {page_data.total} 封 · {range_text} · {page_text}</span></div>
+  </div>
+  <a class="button primary" href="{html.escape(listing_url(params.unread_only, params.limit, page_data.offset), quote=True)}">刷新列表</a>
+</header>
+<div class="control-bar">
+  <div class="filter-group">
+    <nav class="segmented" aria-label="邮件筛选">
+      <a class="segment" href="{html.escape(unread_url, quote=True)}"{ ' aria-current="page"' if params.unread_only else ''}>仅看未读</a>
+      <a class="segment" href="{html.escape(all_url, quote=True)}"{ ' aria-current="page"' if not params.unread_only else ''}>查看全部</a>
+    </nav>
+    <form class="page-size-form" method="get" action="/">
+      <input type="hidden" name="unread" value="{"1" if params.unread_only else "0"}">
+      <input type="hidden" name="page" value="1">
+      <label class="field-label" for="page-size">每页</label>
+      <select class="select" id="page-size" name="limit">{''.join(f'<option value="{value}"{" selected" if params.limit == value else ""}>{value} 封</option>' for value in (30, 50, 100))}</select>
+      <button class="button" type="submit">应用</button>
+    </form>
+  </div>
+</div>
+{notice}
+{self._pagination(page_data, params)}
+<section class="mailbox" aria-label="{selected_mode}列表">
+  <div class="list-head"><span>发件人</span><span>主题</span><span>日期</span></div>
+  {listing}
+</section>
+{self._pagination(page_data, params)}'''
         self._send(page("QQ 邮箱查看器", content))
 
     def _message(self, query: dict[str, list[str]]) -> None:
         uid = query.get("uid", [""])[0]
+        params = parse_listing_params(query)
         with configured_client() as client:
             item = client.get_message(uid)
         attachment_box = ""
         if item.attachments:
             names = "、".join(html.escape(name) for name in item.attachments)
-            attachment_box = f'<div class="attachments">附件（仅列出，不下载）：{names}</div>'
-        content = f"""<header><div><h1>{html.escape(item.subject)}</h1><div class="muted">只读查看，不会标为已读</div></div><a class="button" href="/">返回</a></header><article class="card message"><div class="meta"><strong>发件人</strong><span>{html.escape(item.sender)}</span><strong>收件人</strong><span>{html.escape(item.recipients)}</span><strong>时间</strong><span>{html.escape(item.date)}</span></div>{attachment_box}<div class="body">{html.escape(item.text) or '（邮件没有可显示的文本正文）'}</div></article>"""
+            attachment_box = f'<aside class="attachments"><span class="attachment-label">附件</span>（仅列出，不下载）：{names}</aside>'
+        back_url = listing_url(params.unread_only, params.limit, params.offset)
+        content = f'''<header class="detail-header">
+  <div><h1 class="detail-subject">{html.escape(item.subject)}</h1><p class="read-only-note">只读查看，不会标为已读</p></div>
+  <a class="button" href="{html.escape(back_url, quote=True)}">返回邮件列表</a>
+</header>
+<article class="message-shell">
+  <dl class="message-meta"><dt>发件人</dt><dd>{html.escape(item.sender)}</dd><dt>收件人</dt><dd>{html.escape(item.recipients)}</dd><dt>时间</dt><dd>{html.escape(item.date)}</dd></dl>
+  {attachment_box}
+  <div class="body">{html.escape(item.text) or '（邮件没有可显示的文本正文）'}</div>
+</article>'''
         self._send(page(item.subject, content))
 
     def _api_messages(self, query: dict[str, list[str]]) -> None:
-        unread, limit, offset = self._params(query)
+        params = parse_listing_params(query)
         with configured_client() as client:
-            messages = client.list_messages(unread_only=unread, limit=limit, offset=offset)
+            messages = client.list_messages(
+                unread_only=params.unread_only, limit=params.limit, offset=params.offset
+            )
         payload = json.dumps([asdict(item) for item in messages], ensure_ascii=False, indent=2).encode("utf-8")
         self._send(payload, content_type="application/json; charset=utf-8")
 

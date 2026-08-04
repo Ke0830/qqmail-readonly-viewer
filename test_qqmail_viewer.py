@@ -6,13 +6,16 @@ import uuid
 from types import SimpleNamespace
 from datetime import datetime, timezone
 from email.utils import format_datetime
+from urllib.parse import parse_qs, urlparse
 from unittest.mock import MagicMock, patch
 
 from qqmail_viewer import (
     AUTH_SERVICE,
     EMAIL_SERVICE,
     KEYCHAIN_ACCOUNT,
+    ListingParams,
     QQMailClient,
+    ViewerHandler,
     ViewerError,
     build_parser,
     decode_bytes,
@@ -20,7 +23,9 @@ from qqmail_viewer import (
     extract_message_text,
     keychain_get,
     keychain_set,
+    listing_url,
     normalize_date,
+    parse_listing_params,
     _configure_standard_streams,
     _windows_credential_get,
     _windows_credential_set,
@@ -130,6 +135,61 @@ AA==
 
         self.assertEqual([message.subject for message in messages], ["newest", "still recent"])
         self.assertEqual([message.subject for message in second_page], ["still recent"])
+
+    def test_browser_page_returns_total_and_clamps_to_last_page(self):
+        headers = {
+            str(index): (
+                f"Subject: message {index}\r\nFrom: sender{index}@example.com\r\n"
+                f"Date: Mon, 04 Aug 2025 0{index}:00:00 +0000\r\n\r\n"
+            ).encode()
+            for index in range(1, 4)
+        }
+        client = QQMailClient("user@example.com", "authorization-code")
+        client.connection = _FakeIMAP(headers)
+
+        result = client.list_page(unread_only=False, limit=2, offset=50)
+
+        self.assertEqual(result.total, 3)
+        self.assertEqual(result.offset, 2)
+        self.assertEqual(result.current_page, 2)
+        self.assertEqual(result.page_count, 2)
+        self.assertEqual([message.subject for message in result.messages], ["message 1"])
+
+    def test_browser_page_handles_an_empty_mailbox(self):
+        client = QQMailClient("user@example.com", "authorization-code")
+        client.connection = _FakeIMAP({})
+
+        result = client.list_page(unread_only=True, limit=30, offset=0)
+
+        self.assertEqual(result.total, 0)
+        self.assertEqual(result.current_page, 0)
+        self.assertEqual(result.page_count, 0)
+        self.assertEqual(result.messages, ())
+
+    def test_page_query_has_priority_and_legacy_offset_still_works(self):
+        page_params = parse_listing_params(
+            {"unread": ["0"], "limit": ["50"], "page": ["3"], "offset": ["999"]}
+        )
+        offset_params = parse_listing_params({"unread": ["1"], "limit": ["50"], "offset": ["100"]})
+
+        self.assertEqual((page_params.unread_only, page_params.limit, page_params.offset), (False, 50, 100))
+        self.assertEqual((offset_params.requested_page, offset_params.offset), (3, 100))
+        self.assertEqual(listing_url(False, 50, 100), "/?unread=0&limit=50&page=3")
+
+    def test_invalid_browser_page_is_reported_as_first_page(self):
+        result = parse_listing_params({"page": ["not-a-number"]})
+
+        self.assertEqual((result.offset, result.requested_page), (0, 1))
+        self.assertTrue(result.invalid_page)
+
+    def test_detail_url_preserves_the_list_position(self):
+        params = ListingParams(unread_only=False, limit=50, offset=100, requested_page=3)
+        item = SimpleNamespace(uid="168")
+
+        detail_url = ViewerHandler._message_url(item, params, 100)
+        detail_params = parse_listing_params(parse_qs(urlparse(detail_url).query))
+
+        self.assertEqual(listing_url(detail_params.unread_only, detail_params.limit, detail_params.offset), "/?unread=0&limit=50&page=3")
 
     def test_uses_windows_credential_backend_only_on_windows(self):
         with patch("qqmail_viewer.sys.platform", "win32"), patch(
