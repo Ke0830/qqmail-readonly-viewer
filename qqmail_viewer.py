@@ -16,6 +16,7 @@ import json
 import re
 import subprocess
 import sys
+import time
 from dataclasses import asdict, dataclass
 from email.header import Header, decode_header
 from email.message import Message
@@ -259,7 +260,14 @@ class QQMailClient:
             raise ViewerError("邮箱连接尚未建立。")
         return self.connection
 
-    def list_messages(self, *, unread_only: bool, limit: int, offset: int = 0) -> list[MailSummary]:
+    def list_messages(
+        self,
+        *,
+        unread_only: bool,
+        limit: int | None,
+        offset: int = 0,
+        since_hours: float | None = None,
+    ) -> list[MailSummary]:
         criteria = "UNSEEN" if unread_only else "ALL"
         status, data = self._imap().uid("search", None, criteria)
         if status != "OK" or not data:
@@ -300,7 +308,11 @@ class QQMailClient:
                 )
                 dated_messages.append((timestamp, int(uid), summary))
         dated_messages.sort(key=lambda item: (item[0], item[1]), reverse=True)
-        return [item[2] for item in dated_messages[offset : offset + limit]]
+        if since_hours is not None:
+            cutoff = time.time() - since_hours * 60 * 60
+            dated_messages = [item for item in dated_messages if item[0] >= cutoff]
+        end = offset + limit if limit is not None else None
+        return [item[2] for item in dated_messages[offset:end]]
 
     def get_message(self, uid: str) -> MailDetail:
         if not uid.isdigit():
@@ -460,9 +472,17 @@ class ViewerHandler(BaseHTTPRequestHandler):
         sys.stderr.write("[viewer] " + (format % args) + "\n")
 
 
-def list_cli(unread: bool, limit: int, include_text: bool) -> None:
+def list_cli(
+    unread: bool,
+    limit: int | None,
+    include_text: bool,
+    since_hours: float | None,
+    offset: int,
+) -> None:
     with configured_client() as client:
-        summaries = client.list_messages(unread_only=unread, limit=limit)
+        summaries = client.list_messages(
+            unread_only=unread, limit=limit, offset=offset, since_hours=since_hours
+        )
         if include_text:
             result = []
             for summary in summaries:
@@ -487,7 +507,10 @@ def build_parser() -> argparse.ArgumentParser:
     mode = list_parser.add_mutually_exclusive_group()
     mode.add_argument("--unread", action="store_true", default=True, help="仅列出未读邮件（默认）")
     mode.add_argument("--all", action="store_true", help="列出最近的全部邮件")
-    list_parser.add_argument("--limit", type=int, default=20, help="最多返回多少封，1–100")
+    list_parser.add_argument("--limit", type=int, default=20, help="单页最多返回多少封，不设上限")
+    list_parser.add_argument("--offset", type=int, default=0, help="跳过前 N 封，配合 --limit 分页")
+    list_parser.add_argument("--all-pages", action="store_true", help="返回所有符合条件的邮件，不分页、不设上限")
+    list_parser.add_argument("--since-hours", type=float, help="仅返回最近 N 小时内收到的邮件")
     list_parser.add_argument("--include-text", action="store_true", help="附带每封邮件前 1200 字正文预览")
 
     show_parser = sub.add_parser("show", help="以 JSON 读取一封邮件的完整文本正文")
@@ -505,8 +528,14 @@ def main() -> int:
         if args.command == "configure":
             configure(args.email)
         elif args.command == "list":
-            limit = min(max(args.limit, 1), MAX_LIMIT)
-            list_cli(not args.all, limit, args.include_text)
+            if args.limit <= 0:
+                raise ViewerError("--limit 必须大于 0。")
+            if args.offset < 0:
+                raise ViewerError("--offset 不能小于 0。")
+            if args.since_hours is not None and args.since_hours <= 0:
+                raise ViewerError("--since-hours 必须大于 0。")
+            limit = None if args.all_pages else args.limit
+            list_cli(not args.all, limit, args.include_text, args.since_hours, args.offset)
         elif args.command == "show":
             with configured_client() as client:
                 print(json.dumps(asdict(client.get_message(args.uid)), ensure_ascii=False, indent=2))

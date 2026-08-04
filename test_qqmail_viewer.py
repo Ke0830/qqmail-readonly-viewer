@@ -1,7 +1,27 @@
 import email
 import unittest
+from datetime import datetime, timezone
+from email.utils import format_datetime
+from unittest.mock import patch
 
-from qqmail_viewer import decode_bytes, decode_mime, extract_message_text, normalize_date
+from qqmail_viewer import QQMailClient, build_parser, decode_bytes, decode_mime, extract_message_text, normalize_date
+
+
+class _FakeIMAP:
+    def __init__(self, headers: dict[str, bytes]) -> None:
+        self.headers = headers
+
+    def uid(self, command: str, *args: object):
+        if command == "search":
+            return "OK", [" ".join(self.headers).encode("ascii")]
+        if command == "fetch":
+            uids = str(args[0]).split(",")
+            rows = []
+            for uid in uids:
+                metadata = f"1 (UID {uid} RFC822.SIZE 42)".encode("ascii")
+                rows.append((metadata, self.headers[uid]))
+            return "OK", rows
+        raise AssertionError(f"unexpected IMAP command: {command}")
 
 
 class MailParsingTests(unittest.TestCase):
@@ -58,6 +78,37 @@ AA==
     def test_normalizes_rfc_date(self):
         result = normalize_date("Mon, 04 Aug 2025 08:30:00 +0800")
         self.assertRegex(result, r"^2025-08-04 08:30$")
+
+    def test_list_parser_supports_time_filter_pagination_and_all_pages(self):
+        args = build_parser().parse_args(
+            ["list", "--unread", "--since-hours", "24", "--all-pages", "--offset", "100"]
+        )
+        self.assertEqual(args.since_hours, 24)
+        self.assertTrue(args.all_pages)
+        self.assertEqual(args.offset, 100)
+
+    def test_filters_by_recent_hours_before_paging(self):
+        now = 1_754_000_000
+
+        def headers(subject: str, timestamp: float) -> bytes:
+            date = format_datetime(datetime.fromtimestamp(timestamp, timezone.utc))
+            return f"Subject: {subject}\r\nFrom: sender@example.com\r\nDate: {date}\r\n\r\n".encode()
+
+        client = QQMailClient("user@example.com", "authorization-code")
+        client.connection = _FakeIMAP(
+            {
+                "1": headers("newest", now - 60),
+                "2": headers("still recent", now - 23 * 60 * 60),
+                "3": headers("too old", now - 25 * 60 * 60),
+            }
+        )
+
+        with patch("qqmail_viewer.time.time", return_value=now):
+            messages = client.list_messages(unread_only=True, limit=None, since_hours=24)
+            second_page = client.list_messages(unread_only=True, limit=1, offset=1, since_hours=24)
+
+        self.assertEqual([message.subject for message in messages], ["newest", "still recent"])
+        self.assertEqual([message.subject for message in second_page], ["still recent"])
 
 
 if __name__ == "__main__":
