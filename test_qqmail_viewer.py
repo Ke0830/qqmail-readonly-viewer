@@ -10,7 +10,9 @@ from urllib.parse import parse_qs, urlparse
 from unittest.mock import MagicMock, patch
 
 from qqmail_viewer import (
+    ACCOUNT_INDEX_SERVICE,
     AUTH_SERVICE,
+    Account,
     EMAIL_SERVICE,
     KEYCHAIN_ACCOUNT,
     ListingParams,
@@ -30,6 +32,12 @@ from qqmail_viewer import (
     _windows_credential_get,
     _windows_credential_set,
     _windows_keyring,
+    _configured_profile,
+    aggregate_cli,
+    aggregate_page,
+    detect_provider,
+    find_account,
+    load_accounts,
 )
 
 
@@ -190,6 +198,135 @@ AA==
         detail_params = parse_listing_params(parse_qs(urlparse(detail_url).query))
 
         self.assertEqual(listing_url(detail_params.unread_only, detail_params.limit, detail_params.offset), "/?unread=0&limit=50&page=3")
+
+    def test_detail_url_keeps_account_and_aggregate_return_target(self):
+        params = ListingParams(unread_only=True, limit=30, offset=60, requested_page=3)
+        detail_url = ViewerHandler._message_url(SimpleNamespace(uid="42"), params, 60, "icloud", "all")
+        query = parse_qs(urlparse(detail_url).query)
+
+        self.assertEqual(query["account"], ["icloud"])
+        self.assertEqual(query["return_account"], ["all"])
+        self.assertEqual(listing_url(True, 30, 60, "all"), "/?unread=1&limit=30&page=3&account=all")
+
+    def test_detects_supported_provider_domains(self):
+        expected = {
+            "person@qq.com": "qq",
+            "person@foxmail.com": "qq",
+            "person@163.com": "163",
+            "person@126.com": "126",
+            "person@yeah.net": "yeah",
+            "person@icloud.com": "icloud",
+            "person@gmail.com": "gmail",
+        }
+        self.assertEqual({address: detect_provider(address) for address in expected}, expected)
+        self.assertIsNone(detect_provider("person@example.com"))
+
+    def test_validates_custom_imaps_and_preconfigured_profiles(self):
+        provider, host, port = _configured_profile("custom", "person@example.com", "imap.example.com", 1993)
+        self.assertEqual((provider.id, host, port), ("custom", "imap.example.com", 1993))
+        with self.assertRaisesRegex(ViewerError, "必须提供 --imap-host"):
+            _configured_profile("custom", "person@example.com", None, None)
+        with self.assertRaisesRegex(ViewerError, "不需要 --imap-host"):
+            _configured_profile("gmail", "person@gmail.com", "imap.example.com", None)
+
+    def test_legacy_qq_credentials_are_a_default_virtual_account(self):
+        credentials = {EMAIL_SERVICE: "legacy@qq.com", AUTH_SERVICE: "secret"}
+        def get_legacy(service):
+            if service in credentials:
+                return credentials[service]
+            raise ViewerError("missing")
+
+        with patch("qqmail_viewer.keychain_get", side_effect=get_legacy):
+            accounts = load_accounts()
+
+        self.assertEqual(len(accounts), 1)
+        self.assertEqual((accounts[0].name, accounts[0].provider, accounts[0].email), ("qq", "qq", "legacy@qq.com"))
+        self.assertTrue(accounts[0].is_default)
+        self.assertEqual(accounts[0].auth_service, AUTH_SERVICE)
+
+    def test_find_account_uses_default_and_rejects_unknown_name(self):
+        accounts = (
+            Account("qq", "qq", "a@qq.com", "imap.qq.com", 993, "email-a", "auth-a", True),
+            Account("gmail", "gmail", "b@gmail.com", "imap.gmail.com", 993, "email-b", "auth-b"),
+        )
+        self.assertEqual(find_account(None, accounts).name, "qq")
+        self.assertEqual(find_account("gmail", accounts).email, "b@gmail.com")
+        with self.assertRaisesRegex(ViewerError, "可用账户"):
+            find_account("missing", accounts)
+
+    def test_aggregate_sorts_accounts_and_keeps_uid_ownership(self):
+        accounts = (
+            Account("qq", "qq", "a@qq.com", "imap.qq.com", 993, "email-a", "auth-a", True),
+            Account("gmail", "gmail", "b@gmail.com", "imap.gmail.com", 993, "email-b", "auth-b"),
+        )
+
+        class FakeClient:
+            def __init__(self, messages): self.messages = messages
+            def __enter__(self): return self
+            def __exit__(self, *args): return None
+            def list_messages(self, **kwargs): return self.messages
+
+        from qqmail_viewer import MailSummary
+
+        messages = {
+            "qq": [MailSummary("7", "QQ", "a", "2026-08-04 10:00", 1)],
+            "gmail": [MailSummary("7", "Gmail", "b", "2026-08-04 11:00", 1)],
+        }
+        with patch("qqmail_viewer.configured_client", side_effect=lambda account: FakeClient(messages[account.name])):
+            page, rows, errors = aggregate_page(accounts, unread_only=False, limit=30)
+
+        self.assertFalse(errors)
+        self.assertEqual(page.total, 2)
+        self.assertEqual([(row.account.name, row.message.uid) for row in rows], [("gmail", "7"), ("qq", "7")])
+
+    def test_aggregate_reports_a_failed_account_but_keeps_successes(self):
+        accounts = (
+            Account("qq", "qq", "a@qq.com", "imap.qq.com", 993, "email-a", "auth-a", True),
+            Account("bad", "custom", "b@example.com", "imap.example.com", 993, "email-b", "auth-b"),
+        )
+
+        class GoodClient:
+            def __enter__(self): return self
+            def __exit__(self, *args): return None
+            def list_messages(self, **kwargs):
+                from qqmail_viewer import MailSummary
+                return [MailSummary("1", "ok", "sender", "2026-08-04 12:00", 1)]
+
+        def fake_client(account):
+            if account.name == "bad":
+                raise ViewerError("连接失败")
+            return GoodClient()
+
+        with patch("qqmail_viewer.configured_client", side_effect=fake_client):
+            result = aggregate_cli(accounts, unread=True, limit=20, offset=0, since_hours=None, include_text=False)
+
+        self.assertEqual(result["messages"][0]["account"]["name"], "qq")
+        self.assertEqual(result["errors"], [{"account": "bad", "error": "连接失败"}])
+
+    def test_aggregate_web_view_shows_account_selector_warning_and_owned_links(self):
+        from qqmail_viewer import MailPage, MailSummary
+
+        accounts = (
+            Account("qq", "qq", "a@qq.com", "imap.qq.com", 993, "email-a", "auth-a", True),
+            Account("gmail", "gmail", "b@gmail.com", "imap.gmail.com", 993, "email-b", "auth-b"),
+        )
+        summary = MailSummary("8", "A subject", "Person <person@example.com>", "2026-08-04 12:00", 1)
+        handler = object.__new__(ViewerHandler)
+        handler._send = MagicMock()
+        page_data = MailPage((summary,), 1, 0, 30)
+
+        with patch("qqmail_viewer.load_accounts", return_value=accounts), patch(
+            "qqmail_viewer.aggregate_page",
+            return_value=(page_data, (SimpleNamespace(message=summary, account=accounts[1]),), ({"account": "qq", "error": "连接失败"},)),
+        ):
+            handler._home({"account": ["all"], "unread": ["0"], "limit": ["30"], "page": ["1"]})
+
+        body = handler._send.call_args.args[0].decode("utf-8")
+        self.assertIn("全部账户", body)
+        self.assertIn("gmail · b@gmail.com", body)
+        self.assertIn("账户 qq 暂时无法读取", body)
+        self.assertIn("account=gmail", body)
+        self.assertIn("return_account=all", body)
 
     def test_uses_windows_credential_backend_only_on_windows(self):
         with patch("qqmail_viewer.sys.platform", "win32"), patch(
