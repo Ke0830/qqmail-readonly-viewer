@@ -45,6 +45,18 @@ class ViewerError(RuntimeError):
     """An expected, user-facing error."""
 
 
+def _configure_standard_streams() -> None:
+    """Use UTF-8 for CLI output, including redirected Windows terminals."""
+    for stream in (sys.stdout, sys.stderr):
+        reconfigure = getattr(stream, "reconfigure", None)
+        if not callable(reconfigure):
+            continue
+        try:
+            reconfigure(encoding="utf-8", errors="replace")
+        except (OSError, ValueError):
+            pass
+
+
 class _TextExtractor(HTMLParser):
     def __init__(self) -> None:
         super().__init__()
@@ -579,6 +591,7 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 def main() -> int:
+    _configure_standard_streams()
     parser = build_parser()
     args = parser.parse_args()
     try:

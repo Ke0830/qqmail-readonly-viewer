@@ -21,6 +21,7 @@ from qqmail_viewer import (
     keychain_get,
     keychain_set,
     normalize_date,
+    _configure_standard_streams,
     _windows_credential_get,
     _windows_credential_set,
     _windows_keyring,
@@ -151,6 +152,15 @@ AA==
         context = constructor.call_args.kwargs["ssl_context"]
         self.assertEqual(context.verify_mode, ssl.CERT_REQUIRED)
         self.assertTrue(context.check_hostname)
+
+    def test_configures_cli_streams_for_utf8_output(self):
+        stdout = MagicMock()
+        stderr = MagicMock()
+        with patch("qqmail_viewer.sys.stdout", stdout), patch("qqmail_viewer.sys.stderr", stderr):
+            _configure_standard_streams()
+
+        stdout.reconfigure.assert_called_once_with(encoding="utf-8", errors="replace")
+        stderr.reconfigure.assert_called_once_with(encoding="utf-8", errors="replace")
 
     def test_rejects_non_windows_keyring_backend(self):
         class UnsafeBackend:
