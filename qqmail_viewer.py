@@ -1300,13 +1300,165 @@ BASE_STYLE = """
 :root{color-scheme:light dark;--canvas:#fff;--surface:#fff;--surface-raised:#f5f5f5;--ink:#242424;--muted:#6b6b6b;--quiet:#969696;--line:#e6e6e6;--line-strong:#d4d4d4;--accent:#282828;--accent-ink:#fff;--accent-wash:#ededed;--danger:#9b2d30;--danger-wash:#fff2f2;--shadow:0 18px 42px rgba(0,0,0,.06)}
 @media(prefers-color-scheme:dark){:root{--canvas:#191919;--surface:#202020;--surface-raised:#292929;--ink:#f2f2f2;--muted:#b5b5b5;--quiet:#858585;--line:#343434;--line-strong:#4a4a4a;--accent:#d9d9d9;--accent-ink:#1b1b1b;--accent-wash:#303030;--danger:#ffb6b6;--danger-wash:#392126;--shadow:0 18px 42px rgba(0,0,0,.24)}}
 *{box-sizing:border-box}body{margin:0;background:var(--canvas);color:var(--ink);font:15px/1.55 -apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif}button,input,select{font:inherit}a{color:inherit}main{max-width:1160px;margin:0 auto;padding:48px 26px 76px}h1,h2,p{margin:0}.app-header{display:flex;align-items:flex-end;justify-content:space-between;gap:28px;padding-bottom:26px;border-bottom:1px solid var(--line)}h1{font-size:clamp(26px,4vw,34px);line-height:1.12;letter-spacing:-.025em}.account{margin-top:8px;color:var(--muted);overflow-wrap:anywhere}.mailbox-state{display:flex;flex-wrap:wrap;gap:8px;margin-top:16px}.state-chip{padding:4px 9px;border-radius:999px;background:var(--accent-wash);color:var(--accent);font-size:13px;font-weight:700}.state-text{padding:4px 0;color:var(--muted);font-size:13px}.control-bar{display:flex;align-items:center;justify-content:space-between;gap:16px;padding:18px 0}.filter-group,.pagination,.jump-form,.account-switcher,.page-size-switcher{display:flex;align-items:center;gap:8px;flex-wrap:wrap}.segmented{display:flex;padding:3px;border:1px solid var(--line);border-radius:11px;background:var(--surface-raised)}.account-tabs,.page-size-tabs{flex-wrap:wrap}.segment{padding:7px 11px;border-radius:8px;text-decoration:none;color:var(--muted);font-size:14px;font-weight:650}.segment[aria-current="page"]{background:var(--surface);box-shadow:0 2px 7px rgba(30,44,67,.12);color:var(--ink)}.field-label{color:var(--muted);font-size:13px;font-weight:650}.select,.page-input{height:35px;border:1px solid var(--line-strong);border-radius:8px;background:var(--surface);color:var(--ink);padding:0 9px}.page-input{width:52px;text-align:center}.button,.page-link{min-height:35px;display:inline-flex;align-items:center;justify-content:center;padding:0 11px;border:1px solid var(--line-strong);border-radius:8px;background:var(--surface);color:var(--ink);text-decoration:none;cursor:pointer;font-weight:650;font-size:14px}.button.primary{background:var(--accent);border-color:var(--accent);color:var(--accent-ink)}.button:hover,.page-link:hover{border-color:var(--accent);color:var(--accent)}.button.primary:hover{filter:brightness(1.06);color:var(--accent-ink)}.page-link.disabled{border-color:var(--line);background:var(--surface-raised);color:var(--quiet);cursor:default}.pagination{justify-content:space-between;padding:15px 0}.page-controls{display:flex;align-items:center;gap:7px;flex-wrap:wrap}.page-status{color:var(--muted);font-size:14px;font-weight:650}.mailbox{border-top:1px solid var(--line);border-bottom:1px solid var(--line);background:var(--surface);box-shadow:var(--shadow)}.list-head,.mail{display:grid;grid-template-columns:minmax(220px,1.12fr) minmax(280px,1.85fr) 148px;gap:24px;align-items:center}.list-head{padding:10px 20px;background:var(--surface-raised);border-bottom:1px solid var(--line);color:var(--muted);font-size:12px;font-weight:750;letter-spacing:.04em}.mail{min-height:72px;padding:13px 20px;border-bottom:1px solid var(--line);text-decoration:none;position:relative;transition:background .16s ease,box-shadow .16s ease}.mail:last-child{border-bottom:0}.mail:hover{background:color-mix(in srgb,var(--accent) 6%,var(--surface))}.mail:focus-visible{outline:3px solid color-mix(in srgb,var(--accent) 55%,transparent);outline-offset:-3px;z-index:1}.sender-name{display:block;color:var(--ink);font-weight:650;overflow-wrap:anywhere}.sender-address,.account-tag{display:block;margin-top:2px;color:var(--muted);font-size:13px;overflow-wrap:anywhere}.account-tag{font-size:12px}.subject{font-weight:700;overflow-wrap:anywhere;line-height:1.4}.date{color:var(--muted);font-variant-numeric:tabular-nums;white-space:nowrap;text-align:right}.empty-state,.error-state{padding:64px 24px;text-align:center;background:var(--surface)}.empty-state h2,.error-state h2{font-size:20px}.empty-state p,.error-state p{max-width:48ch;margin:8px auto 0;color:var(--muted)}.notice{margin:0 0 14px;padding:10px 13px;border:1px solid var(--line-strong);background:var(--surface-raised);color:var(--muted);font-size:14px}.notice.warning{border-color:var(--line-strong)}.detail-header{display:flex;align-items:flex-start;justify-content:space-between;gap:24px;padding-bottom:22px;border-bottom:1px solid var(--line)}.detail-subject{max-width:800px;font-size:clamp(24px,3.6vw,32px);overflow-wrap:anywhere}.read-only-note{margin-top:8px;color:var(--muted)}.message-shell{max-width:930px;margin-top:28px;background:var(--surface);box-shadow:var(--shadow)}.message-meta{display:grid;grid-template-columns:90px minmax(0,1fr);gap:10px 22px;padding:24px;border-bottom:1px solid var(--line)}.message-meta dt{color:var(--muted);font-weight:650}.message-meta dd{margin:0;overflow-wrap:anywhere}.attachments{margin:20px 24px 0;padding:13px 15px;border:1px solid var(--line);background:var(--surface-raised)}.attachment-label{font-weight:750}.body{padding:28px 24px 34px;white-space:pre-wrap;overflow-wrap:anywhere;font:15px/1.78 ui-monospace,SFMono-Regular,Menlo,monospace}.error-state{max-width:700px;margin:72px auto;box-shadow:var(--shadow)}.error-state h2{color:var(--danger)}.error-state .button{margin-top:20px}
+.segmented{position:relative;isolation:isolate}.segment{position:relative;z-index:1;transition:color .16s ease}.segmented.is-sliding .segment[aria-current="page"]{background:transparent;box-shadow:none}.segment-slider{position:absolute;z-index:0;border-radius:8px;background:var(--surface);pointer-events:none;will-change:transform}.segment.is-transition-source{color:var(--muted)}.segment.is-transition-target{color:var(--ink)}
+@media(prefers-reduced-motion:reduce){.segment{transition:none}}
 @media(max-width:780px){main{padding:28px 16px 52px}.app-header,.detail-header{display:block}.control-bar{align-items:flex-start;flex-direction:column}.pagination{align-items:flex-start;flex-direction:column}.list-head{display:none}.mail{grid-template-columns:minmax(0,1fr);gap:5px;padding:15px 16px}.subject{grid-column:1;grid-row:1}.mail .sender{grid-column:1;grid-row:2}.date{grid-column:1;grid-row:3;margin-top:2px;text-align:left;white-space:normal;font-size:13px}.sender-name{font-size:14px}.sender-address{max-width:100%;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}.message-shell{margin-top:22px}.message-meta{grid-template-columns:1fr;gap:2px;padding:20px}.message-meta dt:not(:first-child){margin-top:12px}.body{padding:24px 20px}.jump-form{width:100%}.page-input{width:64px}}
 .header-actions{display:flex;align-items:center;gap:8px;flex-wrap:wrap}.number-input{width:110px;height:35px;border:1px solid var(--line-strong);border-radius:8px;background:var(--surface);color:var(--ink);padding:0 9px}.button.danger{border-color:var(--danger);color:var(--danger)}.button:focus-visible,.page-link:focus-visible,.select:focus-visible,.page-input:focus-visible,.number-input:focus-visible,.segment:focus-visible{outline:3px solid color-mix(in srgb,var(--accent) 55%,transparent);outline-offset:2px}.settings-header{display:flex;justify-content:space-between;align-items:flex-start;gap:24px;padding-bottom:24px;border-bottom:1px solid var(--line)}.settings-shell{max-width:760px;margin-top:28px;display:grid;gap:18px}.settings-card{padding:24px;background:var(--surface);border:1px solid var(--line);box-shadow:var(--shadow)}.settings-card h2{font-size:20px}.settings-card p{margin-top:7px;color:var(--muted)}.settings-form{display:grid;gap:18px;margin-top:20px}.form-row{display:grid;grid-template-columns:180px minmax(0,1fr);gap:16px;align-items:center}.form-help{display:block;margin-top:5px;color:var(--muted);font-size:13px}.settings-actions{display:flex;gap:8px;flex-wrap:wrap;padding-top:4px}.danger-zone{border-color:color-mix(in srgb,var(--danger) 35%,var(--line))}.inline-form{display:inline-flex;margin:14px 8px 0 0}@media(max-width:780px){.settings-header{display:block}.header-actions{margin-top:18px}.form-row{grid-template-columns:1fr;gap:6px}.settings-card{padding:20px}}
 """
 
 
+BASE_SCRIPT = """
+(() => {
+  const reducedMotion = window.matchMedia("(prefers-reduced-motion: reduce)");
+  let navigating = false;
+
+  const fetchPage = async (url) => {
+    const response = await window.fetch(url, {
+      credentials: "same-origin",
+      headers: {Accept: "text/html", "X-Requested-With": "qqmail-viewer"},
+    });
+    const contentType = response.headers.get("Content-Type") || "";
+    if (!contentType.includes("text/html")) {
+      throw new Error("目标页面不是 HTML。");
+    }
+    const source = await response.text();
+    const nextDocument = new DOMParser().parseFromString(source, "text/html");
+    const nextMain = nextDocument.querySelector("main");
+    if (!nextMain) throw new Error("目标页面缺少主内容。");
+    return {
+      main: nextMain,
+      title: nextDocument.title,
+      url: response.url || url,
+    };
+  };
+
+  const replacePage = (nextPage, pushHistory, focusGroup) => {
+    const currentMain = document.querySelector("main");
+    if (!currentMain) throw new Error("当前页面缺少主内容。");
+    currentMain.replaceWith(nextPage.main);
+    document.title = nextPage.title;
+    if (pushHistory) {
+      window.history.pushState({mailViewer: true}, "", nextPage.url);
+    }
+    if (focusGroup) {
+      const group = Array.from(document.querySelectorAll(".segmented")).find(
+        (item) => item.getAttribute("aria-label") === focusGroup,
+      );
+      const selected = group?.querySelector('[aria-current="page"]');
+      if (selected) {
+        try {
+          selected.focus({preventScroll: true});
+        } catch (_error) {
+          selected.focus();
+        }
+      }
+    }
+  };
+
+  const slideTo = (group, current, target) => {
+    if (reducedMotion.matches || typeof Element.prototype.animate !== "function") {
+      return Promise.resolve();
+    }
+    const groupRect = group.getBoundingClientRect();
+    const currentRect = current.getBoundingClientRect();
+    const targetRect = target.getBoundingClientRect();
+    const slider = document.createElement("span");
+    slider.className = "segment-slider";
+    slider.setAttribute("aria-hidden", "true");
+    slider.style.left = `${currentRect.left - groupRect.left - group.clientLeft}px`;
+    slider.style.top = `${currentRect.top - groupRect.top - group.clientTop}px`;
+    slider.style.width = `${currentRect.width}px`;
+    slider.style.height = `${currentRect.height}px`;
+    slider.style.transformOrigin = "left center";
+    group.prepend(slider);
+    group.classList.add("is-sliding");
+    current.classList.add("is-transition-source");
+    target.classList.add("is-transition-target");
+
+    const deltaX = targetRect.left - currentRect.left;
+    const deltaY = targetRect.top - currentRect.top;
+    const scaleX = targetRect.width / currentRect.width;
+    const animation = slider.animate(
+      [
+        {transform: "translate3d(0, 0, 0) scaleX(1)"},
+        {transform: `translate3d(${deltaX}px, ${deltaY}px, 0) scaleX(${scaleX})`},
+      ],
+      {
+        duration: 240,
+        easing: "cubic-bezier(0.16, 1, 0.3, 1)",
+        fill: "forwards",
+      },
+    );
+    return Promise.race([
+      animation.finished.catch(() => undefined),
+      new Promise((resolve) => window.setTimeout(resolve, 320)),
+    ]);
+  };
+
+  document.addEventListener("click", async (event) => {
+    if (!(event.target instanceof Element)) return;
+    const target = event.target.closest("a.segment");
+    if (!target) return;
+    if (
+      event.defaultPrevented ||
+      event.button !== 0 ||
+      event.metaKey ||
+      event.ctrlKey ||
+      event.shiftKey ||
+      event.altKey
+    ) return;
+    event.preventDefault();
+    if (navigating || target.getAttribute("aria-current") === "page") return;
+
+    const destination = new URL(target.href, window.location.href);
+    const group = target.closest(".segmented");
+    const current = group?.querySelector('a.segment[aria-current="page"]');
+    if (!group || !current || destination.origin !== window.location.origin) {
+      window.location.assign(destination.href);
+      return;
+    }
+
+    navigating = true;
+    const currentMain = document.querySelector("main");
+    currentMain?.setAttribute("aria-busy", "true");
+    const focusGroup = event.detail === 0 ? group.getAttribute("aria-label") : null;
+    const pageRequest = fetchPage(destination.href);
+    const results = await Promise.allSettled([
+      pageRequest,
+      slideTo(group, current, target),
+    ]);
+    const pageResult = results[0];
+    try {
+      if (pageResult.status !== "fulfilled") throw pageResult.reason;
+      replacePage(pageResult.value, true, focusGroup);
+    } catch (_error) {
+      window.location.assign(destination.href);
+    } finally {
+      currentMain?.removeAttribute("aria-busy");
+      navigating = false;
+    }
+  });
+
+  window.addEventListener("popstate", async () => {
+    if (navigating) return;
+    navigating = true;
+    const currentMain = document.querySelector("main");
+    currentMain?.setAttribute("aria-busy", "true");
+    try {
+      replacePage(await fetchPage(window.location.href), false, null);
+    } catch (_error) {
+      window.location.reload();
+    } finally {
+      currentMain?.removeAttribute("aria-busy");
+      navigating = false;
+    }
+  });
+})();
+"""
+
+
 def page(title: str, content: str) -> bytes:
-    document = f"""<!doctype html><html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><meta name="robots" content="noindex,nofollow"><title>{html.escape(title)}</title><style>{BASE_STYLE}</style></head><body><main>{content}</main></body></html>"""
+    document = f"""<!doctype html><html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><meta name="robots" content="noindex,nofollow"><title>{html.escape(title)}</title><style>{BASE_STYLE}</style><script src="/assets/viewer.js" defer></script></head><body><main>{content}</main></body></html>"""
     return document.encode("utf-8")
 
 
@@ -1331,7 +1483,12 @@ class ViewerHandler(BaseHTTPRequestHandler):
         route = urlparse(self.path)
         try:
             query = parse_qs(route.query)
-            if route.path == "/":
+            if route.path == "/assets/viewer.js":
+                self._send(
+                    BASE_SCRIPT.encode("utf-8"),
+                    content_type="text/javascript; charset=utf-8",
+                )
+            elif route.path == "/":
                 self._home(query)
             elif route.path == "/message":
                 self._message(query)
@@ -1763,7 +1920,7 @@ class ViewerHandler(BaseHTTPRequestHandler):
         self.send_header("X-Content-Type-Options", "nosniff")
         self.send_header("X-Frame-Options", "DENY")
         self.send_header("Referrer-Policy", "no-referrer")
-        self.send_header("Content-Security-Policy", "default-src 'none'; style-src 'unsafe-inline'; base-uri 'none'; frame-ancestors 'none'")
+        self.send_header("Content-Security-Policy", "default-src 'none'; script-src 'self'; connect-src 'self'; style-src 'unsafe-inline'; base-uri 'none'; frame-ancestors 'none'")
         self.end_headers()
         self.wfile.write(body)
 

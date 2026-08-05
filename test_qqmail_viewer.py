@@ -345,6 +345,9 @@ AA==
         self.assertIn("limit=50&amp;page=1&amp;account=all", body)
         self.assertIn("limit=100&amp;page=1&amp;account=all", body)
         self.assertNotIn(">应用</button>", body)
+        self.assertIn('<script src="/assets/viewer.js" defer></script>', body)
+        self.assertNotIn("window.fetch(url", body)
+        self.assertNotIn("@view-transition", body)
         self.assertIn("gmail · b@gmail.com", body)
         self.assertIn("账户 qq 暂时无法读取", body)
         self.assertIn("return_account=all", body)
@@ -373,6 +376,42 @@ AA==
                 self.assertLess(
                     selected_body.index(">50</a>"), selected_body.index(">100</a>")
                 )
+
+    def test_serves_slider_script_and_allows_only_same_origin_script_and_fetch(self):
+        handler = object.__new__(ViewerHandler)
+        handler.path = "/assets/viewer.js"
+        handler._send = MagicMock()
+
+        handler.do_GET()
+
+        script = handler._send.call_args.args[0].decode("utf-8")
+        self.assertIn("segment-slider", script)
+        self.assertIn("duration: 240", script)
+        self.assertIn("window.fetch(url", script)
+        self.assertIn("currentMain.replaceWith(nextPage.main)", script)
+        self.assertIn("window.history.pushState", script)
+        self.assertIn("Promise.allSettled", script)
+        self.assertEqual(
+            handler._send.call_args.kwargs["content_type"],
+            "text/javascript; charset=utf-8",
+        )
+
+        handler = object.__new__(ViewerHandler)
+        handler.send_response = MagicMock()
+        handler.send_header = MagicMock()
+        handler.end_headers = MagicMock()
+        handler.wfile = MagicMock()
+
+        handler._send(b"ok")
+
+        headers = {
+            call.args[0]: call.args[1]
+            for call in handler.send_header.call_args_list
+        }
+        policy = headers["Content-Security-Policy"]
+        self.assertIn("script-src 'self'", policy)
+        self.assertIn("connect-src 'self'", policy)
+        self.assertNotIn("'unsafe-inline'", policy.split("script-src", 1)[1].split(";", 1)[0])
 
     def test_uses_windows_credential_backend_only_on_windows(self):
         with patch("qqmail_viewer.sys.platform", "win32"), patch(
