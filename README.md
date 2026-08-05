@@ -13,7 +13,8 @@
 - QQ / Foxmail、网易 163、126、yeah、iCloud Mail、Gmail，以及手动填写的加密 IMAPS 邮箱。
 - 每个账户独立保存在 macOS 登录钥匙串或 Windows 凭据管理器中；密码、授权码和应用专用密码不会写入项目文件。
 - 网页可查看单个账户或汇总全部已配置账户；汇总时其中一个账户失败不会隐藏其他账户的邮件。
-- 不发送、回复、删除、移动或修改已读状态；不提供附件打开或保存功能，也不持久化邮件正文。
+- 不发送、回复、删除、移动或修改已读状态；不提供附件打开或保存功能，也不会传输附件内容。
+- 邮件列表优先读取本机 SQLite 缓存；默认只把用户实际打开过的文本正文加密缓存到本机，不会预取全部正文。
 
 Gmail 首版使用 IMAP + Google 应用专用密码；没有应用专用密码选项、Google Workspace 组织限制或 Advanced Protection 的账号需要 OAuth，本版本暂不支持。Microsoft 365 / Outlook OAuth 也不在本期范围。
 
@@ -103,7 +104,11 @@ qqmail-viewer accounts
 qqmail-viewer serve
 ```
 
-打开 <http://127.0.0.1:8765>。一个账户时显示该账户；两个或更多账户时默认显示“全部账户”。账户选择、筛选、每页数量、页码和从详情返回的位置都会保留。
+打开 <http://127.0.0.1:8765>。一个账户时显示该账户；两个或更多账户时默认显示“全部账户 · 仅看未读”。账户选择、筛选、每页数量、页码和从详情返回的位置都会保留。
+
+第一次没有缓存时，查看器会并行获取每个账户最多 30 封最新未读候选，网页最多等待 8 秒便显示已完成账户；较慢的账户和全部 `INBOX` 邮件头会继续在后台静默补齐。已有缓存时，列表、账户切换、筛选和分页会直接查询 SQLite，同时按设置的间隔静默检查新邮件。后台完成后不会强制刷新当前页面，下一次点击、翻页或刷新时即可看到更新。
+
+“刷新列表”会触发一次高优先级并行增量同步，最多等待 8 秒后返回当前缓存结果。某个账户失败时，已有缓存仍可浏览，并显示该账户的错误和上次成功同步时间。
 
 命令行读取默认账户的未读邮件：
 
@@ -125,6 +130,43 @@ qqmail-viewer list --all-accounts --unread --since-hours 24 --all-pages --includ
 ```
 
 单账户 JSON 保持原有数组格式；`--all-accounts` 返回 `messages` 与 `errors`，每封邮件带有账户归属。若其中一个账户暂时不可读，其错误会出现在 `errors`，其他账户仍会返回。
+
+### 缓存与同步设置
+
+网页右上角的“缓存设置”或以下命令可以查看当前设置：
+
+```bash
+qqmail-viewer settings
+```
+
+缓存模式：
+
+- `memory`：邮件元数据与打开过的正文只保留在当前进程内，退出后清除。
+- `metadata`：持久化主题、发件人、日期、大小、未读状态和附件名称，正文不落盘。
+- `body`：默认模式；持久化元数据，并使用 AES-GCM 加密缓存用户实际打开过的文本正文。随机加密密钥只保存在 macOS 钥匙串或 Windows 凭据管理器。
+
+默认每 3 分钟自动同步一次。可设置为 `0`（只在网页手动刷新或 CLI 读取时同步）或 `1–1440` 分钟：
+
+```bash
+qqmail-viewer settings --cache-mode body --refresh-minutes 3
+qqmail-viewer settings --refresh-minutes 0
+```
+
+降低缓存模式时必须明确处理旧缓存：
+
+```bash
+qqmail-viewer settings --cache-mode metadata --existing-cache purge
+qqmail-viewer settings --cache-mode memory --existing-cache keep
+```
+
+清理缓存：
+
+```bash
+qqmail-viewer cache clear --bodies
+qqmail-viewer cache clear --all
+```
+
+macOS 缓存位置为 `~/Library/Caches/local-readonly-mail-viewer/mail-cache.sqlite3`；Windows 为 `%LOCALAPPDATA%\local-readonly-mail-viewer\mail-cache.sqlite3`。`--all-pages` 在缓存尚未补齐时会等待完整索引，保证仍返回全部匹配邮件。
 
 ## 配置给 Agent 使用
 
@@ -159,9 +201,10 @@ Agent 必须运行在完成授权的同一台电脑、同一个系统用户下�
 ## 安全设计与限制
 
 - 所有账户只使用 TLS 加密的 IMAPS，并验证服务器证书与主机名；自定义账户不支持明文 IMAP。
-- 只读打开 `INBOX`，使用 `BODY.PEEK` 读取邮件，不会标为已读。
+- 只读打开 `INBOX`，使用 `BODY.PEEK` 读取邮件头和选定的文本 MIME section，不会标为已读。
 - 网页只监听 `127.0.0.1`，不会暴露到局域网或互联网。
-- HTML 邮件仅转换为纯文本，不执行脚本或加载远程图片；附件只显示名称，不解析、不保存，也不提供打开或下载功能。打开邮件详情时，完整原始邮件会通过 IMAP 临时进入内存，因此附件数据也可能随邮件传输，但不会由查看器写入磁盘。
+- HTML 邮件仅转换为纯文本，不执行脚本或加载远程图片。详情页先读取邮件头和 `BODYSTRUCTURE`，只请求非附件的 `text/plain` section；没有纯文本时才请求 `text/html` 并转换为纯文本。附件只从 MIME 结构读取名称，不请求附件 payload，也不回退下载整封原始邮件。
+- SQLite 中的邮件元数据（包括主题、发件人和附件名称）不是正文加密的一部分；默认 `body` 模式下，只有按需缓存的正文使用 AES-GCM 加密。缓存密钥与邮箱凭据分开保存在系统凭据库。
 - 不读取垃圾箱、自定义文件夹或已发送邮件。
 
 你可随时在服务商设置中撤销授权码、应用专用密码或关闭 IMAP，查看器会立即失去该账户的访问能力。

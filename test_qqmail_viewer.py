@@ -313,22 +313,66 @@ AA==
         summary = MailSummary("8", "A subject", "Person <person@example.com>", "2026-08-04 12:00", 1)
         handler = object.__new__(ViewerHandler)
         handler._send = MagicMock()
+        handler._runtime = MagicMock(
+            return_value=SimpleNamespace(
+                accounts=accounts,
+                cache=SimpleNamespace(
+                    sync_state=lambda name: SimpleNamespace(full_sync_complete=True)
+                ),
+            )
+        )
+        handler._prepare_cache = MagicMock(
+            return_value=({"account": "qq", "error": "连接失败"},)
+        )
         page_data = MailPage((summary,), 1, 0, 30)
 
-        with patch("qqmail_viewer.load_accounts", return_value=accounts), patch(
-            "qqmail_viewer.aggregate_page",
-            return_value=(page_data, (SimpleNamespace(message=summary, account=accounts[1]),), ({"account": "qq", "error": "连接失败"},)),
+        with patch(
+            "qqmail_viewer.cached_page",
+            return_value=(page_data, (SimpleNamespace(message=summary, account=accounts[1]),)),
         ):
             handler._home({"account": ["all"], "unread": ["0"], "limit": ["30"], "page": ["1"]})
 
         body = handler._send.call_args.args[0].decode("utf-8")
         self.assertIn("全部账户", body)
-        self.assertIn('<option value="qq">qq · a@qq.com</option>', body)
-        self.assertIn('<option value="gmail">gmail · b@gmail.com</option>', body)
+        self.assertIn("account=qq", body)
+        self.assertIn("account=gmail", body)
+        self.assertIn('aria-label="qq，a@qq.com"', body)
+        self.assertIn('aria-label="gmail，b@gmail.com"', body)
+        self.assertNotIn(">切换</button>", body)
+        self.assertIn('aria-label="每页 30 封" aria-current="page"', body)
+        self.assertLess(body.index(">30</a>"), body.index(">50</a>"))
+        self.assertLess(body.index(">50</a>"), body.index(">100</a>"))
+        self.assertIn("limit=50&amp;page=1&amp;account=all", body)
+        self.assertIn("limit=100&amp;page=1&amp;account=all", body)
+        self.assertNotIn(">应用</button>", body)
         self.assertIn("gmail · b@gmail.com", body)
         self.assertIn("账户 qq 暂时无法读取", body)
-        self.assertIn("account=gmail", body)
         self.assertIn("return_account=all", body)
+
+        with patch(
+            "qqmail_viewer.cached_page",
+            return_value=(page_data, (SimpleNamespace(message=summary, account=accounts[1]),)),
+        ):
+            for selected_limit in (50, 100):
+                handler._home(
+                    {
+                        "account": ["all"],
+                        "unread": ["0"],
+                        "limit": [str(selected_limit)],
+                        "page": ["1"],
+                    }
+                )
+                selected_body = handler._send.call_args.args[0].decode("utf-8")
+                self.assertIn(
+                    f'aria-label="每页 {selected_limit} 封" aria-current="page"',
+                    selected_body,
+                )
+                self.assertLess(
+                    selected_body.index(">30</a>"), selected_body.index(">50</a>")
+                )
+                self.assertLess(
+                    selected_body.index(">50</a>"), selected_body.index(">100</a>")
+                )
 
     def test_uses_windows_credential_backend_only_on_windows(self):
         with patch("qqmail_viewer.sys.platform", "win32"), patch(

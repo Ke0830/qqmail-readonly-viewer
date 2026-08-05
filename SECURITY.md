@@ -14,12 +14,26 @@ Please use GitHub's private vulnerability reporting feature when it is available
 
 If private reporting is unavailable, open a public Issue containing only a minimal, redacted description and ask the maintainer for a private contact channel.
 
-## Credential storage
+## Credential and cache-key storage
 
 The viewer stores each configured account's address and authorization code or app-specific password in the current user's operating-system credential store: the login Keychain on macOS or Credential Manager on Windows. The account index contains only account names, service-provider settings and credential-service identifiers; it never contains the credential value. On Windows, the application rejects overridden `keyring` backends so that it does not silently fall back to a file-based or third-party store.
 
 The viewer never intentionally writes credentials to the repository. Users should revoke the affected authorization code or app-specific password with its email provider immediately if they suspect it has been exposed.
 
+Cache settings and the random 256-bit body-encryption key use separate system credential records. The key is never stored in SQLite. If the key is missing or invalid, a new key is generated and unreadable cached bodies are discarded on access; account credentials are not changed.
+
+## Local cache boundary
+
+The viewer stores mailbox metadata in SQLite so lists, filters and pagination do not need to rescan IMAP. Metadata includes account name, UID, subject, sender, recipient, message dates, size, unread state and attachment names. This metadata is not encrypted by the application and should be protected as local user data.
+
+In the default `body` mode, only text bodies that the user explicitly opens are cached. They are encrypted with AES-GCM and authenticated with their account name and UID. `metadata` mode never persists bodies. `memory` mode uses an in-process SQLite database and creates no cache file. The persistent database uses WAL mode and is stored under the current user's local cache directory.
+
+Changing to a lower cache mode requires an explicit keep-or-purge decision. Users can clear only encrypted bodies or rebuild the entire cache from the web settings page or CLI.
+
 ## Read-only connection boundary
 
-All built-in providers and custom accounts use TLS-protected IMAPS with certificate and hostname verification. Custom accounts cannot opt into plaintext IMAP. The viewer opens `INBOX` in read-only mode and uses `BODY.PEEK`; it does not send, delete, move, mark read, or persist message bodies. Opening a message fetches the complete RFC message into memory, so attachment bytes may be transferred with it, but the viewer does not parse, expose, or save attachments.
+All built-in providers and custom accounts use TLS-protected IMAPS with certificate and hostname verification. Custom accounts cannot opt into plaintext IMAP. The viewer opens `INBOX` in read-only mode and uses `BODY.PEEK`; it does not send, delete, move or mark messages read.
+
+Message lists fetch headers, flags, `INTERNALDATE`, size and `BODYSTRUCTURE`, never a complete RFC message. Opening a detail fetches only a non-attachment `text/plain` MIME section, or a non-attachment `text/html` section when plain text is unavailable. Attachment names are read from `BODYSTRUCTURE`; attachment payloads are never requested. If the MIME structure cannot be identified safely, the viewer refuses to fetch the body instead of falling back to the full message.
+
+The settings page accepts changes only through POST requests carrying a process-local CSRF token. The web server remains bound to `127.0.0.1` and sends a restrictive Content Security Policy; HTML mail is converted to plain text without loading scripts, stylesheets or remote images.
