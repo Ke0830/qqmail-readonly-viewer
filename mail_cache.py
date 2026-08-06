@@ -752,6 +752,7 @@ class CacheStore:
         resource_id: str,
         *,
         source_digest: str | None = None,
+        touch: bool = True,
     ) -> CachedImage | None:
         """Return one encrypted image, preferring the process-local LRU."""
 
@@ -760,8 +761,10 @@ class CacheStore:
             memory = self._image_memory.get(key)
             if memory is not None:
                 if source_digest is None or memory.source_digest == source_digest:
-                    self._image_memory.move_to_end(key)
-                    return replace(memory, accessed_at=time.time())
+                    if touch:
+                        self._image_memory.move_to_end(key)
+                        return replace(memory, accessed_at=time.time())
+                    return memory
                 self._drop_memory_images_locked(account_name=account_name, uid=uid, resource_id=resource_id)
             if not self.body_cache_enabled:
                 return None
@@ -805,17 +808,18 @@ class CacheStore:
             source_digest=row_digest,
             size=len(data),
             created_at=float(row["created_at"]),
-            accessed_at=time.time(),
+            accessed_at=time.time() if touch else float(row["accessed_at"]),
         )
-        with self._lock, self.connection:
-            self.connection.execute(
-                """
-                UPDATE message_images SET accessed_at=?
-                WHERE account_name=? AND uid=? AND resource_id=?
-                """,
-                (image.accessed_at, account_name, int(uid), resource_id),
-            )
-            self._store_memory_image_locked(image)
+        if touch:
+            with self._lock, self.connection:
+                self.connection.execute(
+                    """
+                    UPDATE message_images SET accessed_at=?
+                    WHERE account_name=? AND uid=? AND resource_id=?
+                    """,
+                    (image.accessed_at, account_name, int(uid), resource_id),
+                )
+                self._store_memory_image_locked(image)
         return image
 
     def store_image(

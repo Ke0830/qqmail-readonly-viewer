@@ -4,6 +4,7 @@ import json
 import os
 import sqlite3
 import tempfile
+import threading
 import time
 import unittest
 from pathlib import Path
@@ -49,6 +50,47 @@ def _summary(uid: str, *, unread: bool = True) -> dict[str, object]:
         "unread": unread,
         "attachments": (),
     }
+
+
+def _web_detail(
+    uid: str, *, image_resources: tuple[dict[str, object], ...] = ()
+) -> SimpleNamespace:
+    return SimpleNamespace(
+        uid=str(uid),
+        subject=f"message {uid}",
+        sender="sender@example.com",
+        recipients="reader@example.com",
+        date="2026-08-05 10:00",
+        text=f"body {uid}",
+        attachments=(),
+        body_format="html",
+        safe_html=f"<p>body {uid}</p>",
+        blocked_images=0,
+        html_policy=HTML_POLICY_VERSION,
+        image_resources=image_resources,
+    )
+
+
+def _remote_image_resource(resource_id: str) -> dict[str, object]:
+    return {
+        "id": resource_id,
+        "source_type": "remote",
+        "source": f"https://images.example/{resource_id}.png",
+        "descriptor": "",
+        "section": "",
+        "content_type": "image/png",
+        "encoding": "",
+        "octets": None,
+    }
+
+
+def _wait_until(predicate, timeout: float = 2.0) -> bool:
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        if predicate():
+            return True
+        time.sleep(0.01)
+    return bool(predicate())
 
 
 def _legacy_body_ciphertext(
@@ -329,6 +371,102 @@ class CacheStoreTests(unittest.TestCase):
                 self.assertEqual(runtime.cache.image_bytes_for_message("a", "1"), len(image))
             finally:
                 runtime.close()
+
+    @unittest.skipIf(mail_cache.AESGCM is None, "cryptography is not installed")
+    def test_opening_web_view_prefetches_body_and_data_image(self):
+        account = Account(
+            "a",
+            "qq",
+            "reader@example.com",
+            "imap.qq.com",
+            993,
+            "service.email",
+            "service.secret",
+            True,
+        )
+        output = io.BytesIO()
+        Image.new("RGB", (2, 1), (1, 2, 3)).save(output, format="PNG")
+        source = "data:image/png;base64," + base64.b64encode(
+            output.getvalue()
+        ).decode("ascii")
+        resource = {
+            "id": "r1",
+            "source_type": "data",
+            "source": source,
+            "descriptor": "",
+            "section": "",
+            "content_type": "image/png",
+            "encoding": "base64",
+            "octets": len(output.getvalue()),
+        }
+        detail_calls: list[tuple[str, bool]] = []
+
+        class PrefetchClient:
+            def connect(self):
+                return self
+
+            def noop(self):
+                pass
+
+            def close(self):
+                pass
+
+            def get_message(self, uid, *, prefer_html=False):
+                detail_calls.append((str(uid), prefer_html))
+                return _web_detail(str(uid), image_resources=(resource,))
+
+        with tempfile.TemporaryDirectory() as directory, patch(
+            "qqmail_viewer.configured_client", return_value=PrefetchClient()
+        ):
+            runtime = ViewerRuntime(
+                periodic=False,
+                accounts=(account,),
+                settings=CacheSettings("memory", 3),
+                cache_file=Path(directory) / "mail.sqlite3",
+                encryption_key=b"z" * 32,
+            )
+            try:
+                runtime.cache.upsert_messages("a", [_summary("1", unread=False)])
+                runtime.cache.mark_seeded("a", True)
+                runtime.cache.mark_seeded("a", False)
+                runtime.cache.mark_sync_success(
+                    "a", uidvalidity="1", highest_uid=1, full_sync_complete=True
+                )
+                handler = object.__new__(ViewerHandler)
+                errors = handler._prepare_cache(
+                    runtime,
+                    ("a",),
+                    unread_only=False,
+                    limit=30,
+                    refresh=False,
+                )
+                self.assertEqual(errors, ())
+                self.assertTrue(
+                    _wait_until(
+                        lambda: runtime.cache.load_image(
+                            "a", "1", "r1", touch=False
+                        )
+                        is not None
+                    )
+                )
+                self.assertEqual(detail_calls, [("1", True)])
+                self.assertEqual(
+                    runtime.cache.load_image("a", "1", "r1", touch=False).data,
+                    output.getvalue(),
+                )
+            finally:
+                runtime.close()
+
+    def test_runtime_prefetch_only_schedules_incomplete_account_indexes(self):
+        runtime = object.__new__(ViewerRuntime)
+        runtime.sync = MagicMock()
+
+        runtime.start_prefetch()
+
+        runtime.sync.kick_background.assert_called_once_with(
+            30, incomplete_only=True
+        )
+        runtime.sync.start_prefetch.assert_called_once_with()
 
     @unittest.skipIf(mail_cache.AESGCM is None, "cryptography is not installed")
     def test_legacy_plaintext_ciphertext_is_read_as_v1_cache(self):
@@ -951,6 +1089,251 @@ class SyncManagerTests(unittest.TestCase):
             self.assertEqual(state.detail_calls, [("1", True)])
             manager.stop()
             cache.close()
+
+    @unittest.skipIf(mail_cache.AESGCM is None, "cryptography is not installed")
+    def test_prefetches_read_and_unread_newest_first_then_images(self):
+        account = SimpleNamespace(name="a")
+        state = _RemoteState(["1", "2", "3"], {"2"})
+        image_calls: list[tuple[str, str]] = []
+        completed = threading.Event()
+
+        class PrefetchClient(_WorkerClient):
+            def get_message(self, uid, *, prefer_html=False):
+                self.state.detail_calls.append((str(uid), prefer_html))
+                return _web_detail(
+                    str(uid),
+                    image_resources=(_remote_image_resource(f"r{uid}"),),
+                )
+
+        def prefetch_image(account_name, uid, resource, received_at):
+            image_calls.append((str(uid), str(resource["id"])))
+            if len(image_calls) == 3:
+                completed.set()
+
+        with tempfile.TemporaryDirectory() as directory:
+            cache = CacheStore(
+                Path(directory) / "mail.sqlite3",
+                CacheSettings("body", 3),
+                bytes(range(32)),
+            )
+            cache.upsert_messages(
+                "a",
+                [
+                    _summary("1", unread=False),
+                    _summary("2", unread=True),
+                    _summary("3", unread=False),
+                ],
+            )
+            manager = SyncManager(
+                (account,),
+                cache,
+                CacheSettings("body", 3),
+                lambda _account: PrefetchClient(state),
+                periodic=False,
+                prefetch_image=prefetch_image,
+            )
+            try:
+                manager.start_prefetch()
+                self.assertTrue(completed.wait(2))
+                self.assertEqual(
+                    state.detail_calls,
+                    [("3", True), ("2", True), ("1", True)],
+                )
+                self.assertEqual(
+                    image_calls,
+                    [
+                        ("3", "r3"),
+                        ("2", "r2"),
+                        ("1", "r1"),
+                    ],
+                )
+            finally:
+                manager.stop()
+                cache.close()
+
+    @unittest.skipIf(mail_cache.AESGCM is None, "cryptography is not installed")
+    def test_prefetch_runs_accounts_in_parallel(self):
+        accounts = (SimpleNamespace(name="a"), SimpleNamespace(name="b"))
+        states = {
+            "a": _RemoteState(["1"], set()),
+            "b": _RemoteState(["1"], {"1"}),
+        }
+        started: set[str] = set()
+        started_lock = threading.Lock()
+        both_started = threading.Event()
+
+        class ParallelClient(_WorkerClient):
+            def __init__(self, name, remote):
+                super().__init__(remote)
+                self.name = name
+
+            def get_message(self, uid, *, prefer_html=False):
+                self.state.detail_calls.append((str(uid), prefer_html))
+                with started_lock:
+                    started.add(self.name)
+                    if len(started) == 2:
+                        both_started.set()
+                both_started.wait(1)
+                return _web_detail(str(uid))
+
+        with tempfile.TemporaryDirectory() as directory:
+            cache = CacheStore(
+                Path(directory) / "mail.sqlite3",
+                CacheSettings("body", 3),
+                bytes(range(32)),
+            )
+            cache.upsert_messages("a", [_summary("1", unread=False)])
+            cache.upsert_messages("b", [_summary("1", unread=True)])
+            manager = SyncManager(
+                accounts,
+                cache,
+                CacheSettings("body", 3),
+                lambda account: ParallelClient(account.name, states[account.name]),
+                periodic=False,
+            )
+            try:
+                manager.start_prefetch()
+                self.assertTrue(both_started.wait(1))
+                self.assertTrue(
+                    _wait_until(
+                        lambda: cache.cached_detail("a", "1") is not None
+                        and cache.cached_detail("b", "1") is not None
+                    )
+                )
+            finally:
+                manager.stop()
+                self.assertTrue(
+                    all(not thread.is_alive() for thread in manager._prefetch_threads.values())
+                )
+                cache.close()
+
+    def test_metadata_mode_does_not_start_body_prefetch(self):
+        account = SimpleNamespace(name="a")
+        state = _RemoteState(["1"], {"1"})
+        with tempfile.TemporaryDirectory() as directory:
+            cache = self._cache(directory)
+            cache.upsert_messages("a", [_summary("1")])
+            manager = SyncManager(
+                (account,),
+                cache,
+                CacheSettings("metadata", 3),
+                lambda _account: _WorkerClient(state),
+                periodic=False,
+            )
+            manager.start_prefetch()
+            self.assertEqual(manager._prefetch_threads, {})
+            self.assertEqual(state.detail_calls, [])
+            manager.stop()
+            cache.close()
+
+    @unittest.skipIf(mail_cache.AESGCM is None, "cryptography is not installed")
+    def test_interactive_detail_jumps_ahead_of_remaining_prefetch(self):
+        account = SimpleNamespace(name="a")
+        state = _RemoteState(["1", "2", "3"], set())
+        newest_started = threading.Event()
+        release_newest = threading.Event()
+        interactive_done = threading.Event()
+        interactive_errors: list[Exception] = []
+
+        class PriorityClient(_WorkerClient):
+            def get_message(self, uid, *, prefer_html=False):
+                self.state.detail_calls.append((str(uid), prefer_html))
+                if str(uid) == "3":
+                    newest_started.set()
+                    release_newest.wait(1)
+                return _web_detail(str(uid))
+
+        with tempfile.TemporaryDirectory() as directory:
+            cache = CacheStore(
+                Path(directory) / "mail.sqlite3",
+                CacheSettings("body", 3),
+                bytes(range(32)),
+            )
+            cache.upsert_messages("a", [_summary("1"), _summary("2"), _summary("3")])
+            manager = SyncManager(
+                (account,),
+                cache,
+                CacheSettings("body", 3),
+                lambda _account: PriorityClient(state),
+                periodic=False,
+            )
+
+            def fetch_interactive() -> None:
+                try:
+                    manager.fetch_detail("a", "1", prefer_html=True)
+                except Exception as exc:
+                    interactive_errors.append(exc)
+                finally:
+                    interactive_done.set()
+
+            reader = threading.Thread(target=fetch_interactive)
+            try:
+                manager.start_prefetch()
+                self.assertTrue(newest_started.wait(1))
+                reader.start()
+                self.assertTrue(
+                    _wait_until(lambda: manager.workers["a"].jobs.qsize() >= 1)
+                )
+                release_newest.set()
+                self.assertTrue(interactive_done.wait(2))
+                self.assertTrue(_wait_until(lambda: len(state.detail_calls) == 3))
+                self.assertEqual(interactive_errors, [])
+                self.assertEqual(
+                    state.detail_calls,
+                    [("3", True), ("1", True), ("2", True)],
+                )
+            finally:
+                release_newest.set()
+                manager.stop()
+                reader.join(timeout=1)
+                cache.close()
+
+    @unittest.skipIf(mail_cache.AESGCM is None, "cryptography is not installed")
+    def test_failed_prefetch_is_retried_on_next_start(self):
+        account = SimpleNamespace(name="a")
+        state = _RemoteState(["1"], set())
+        image_attempts = 0
+        retried = threading.Event()
+
+        class RetryClient(_WorkerClient):
+            def get_message(self, uid, *, prefer_html=False):
+                self.state.detail_calls.append((str(uid), prefer_html))
+                return _web_detail(
+                    str(uid), image_resources=(_remote_image_resource("r1"),)
+                )
+
+        def prefetch_image(account_name, uid, resource, received_at):
+            nonlocal image_attempts
+            image_attempts += 1
+            if image_attempts == 1:
+                raise OSError("temporary image failure")
+            retried.set()
+
+        with tempfile.TemporaryDirectory() as directory:
+            cache = CacheStore(
+                Path(directory) / "mail.sqlite3",
+                CacheSettings("body", 3),
+                bytes(range(32)),
+            )
+            cache.upsert_messages("a", [_summary("1")])
+            manager = SyncManager(
+                (account,),
+                cache,
+                CacheSettings("body", 3),
+                lambda _account: RetryClient(state),
+                periodic=False,
+                prefetch_image=prefetch_image,
+            )
+            try:
+                manager.start_prefetch()
+                self.assertTrue(_wait_until(lambda: image_attempts == 1))
+                manager.start_prefetch()
+                self.assertTrue(retried.wait(2))
+                self.assertEqual(image_attempts, 2)
+                self.assertEqual(state.detail_calls, [("1", True)])
+            finally:
+                manager.stop()
+                cache.close()
 
     @unittest.skipIf(mail_cache.AESGCM is None, "cryptography is not installed")
     def test_failed_detail_preserves_existing_body_and_attachments_without_caching_error(self):

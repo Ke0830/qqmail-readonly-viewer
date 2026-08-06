@@ -10,6 +10,11 @@ from dataclasses import dataclass, field
 from typing import Callable, Iterable
 
 from mail_cache import CacheSettings, CacheStore
+from mail_html import HTML_POLICY_VERSION
+
+
+_PREFETCH_DETAIL_PRIORITY = 20
+_PREFETCH_IMAGE_PRIORITY = 21
 
 
 @dataclass(order=True)
@@ -29,10 +34,17 @@ class _Job:
 
 
 class _AccountWorker:
-    def __init__(self, account, cache: CacheStore, client_factory: Callable) -> None:
+    def __init__(
+        self,
+        account,
+        cache: CacheStore,
+        client_factory: Callable,
+        cache_changed: Callable[[str], None],
+    ) -> None:
         self.account = account
         self.cache = cache
         self.client_factory = client_factory
+        self.cache_changed = cache_changed
         self.jobs: queue.PriorityQueue[_Job] = queue.PriorityQueue()
         self._pending: dict[str, _Job] = {}
         self._pending_lock = threading.Lock()
@@ -111,16 +123,18 @@ class _AccountWorker:
                             job.result = self._seed(client, job.unread_only, job.limit)
                         elif job.kind in {"sync", "sync_urgent"}:
                             job.result = self._sync(client)
-                        elif job.kind == "detail":
+                        elif job.kind in {"detail", "detail_prefetch"}:
                             job.result = self._detail(
                                 client, job.uid, prefer_html=job.prefer_html
                             )
-                        elif job.kind == "image":
+                        elif job.kind in {"image", "image_prefetch"}:
                             job.result = client.fetch_inline_image(
                                 job.uid, job.image_resource
                             )
                         else:
                             raise RuntimeError(f"unknown sync job: {job.kind}")
+                        if job.kind in {"seed", "sync", "sync_urgent"}:
+                            self.cache_changed(self.account.name)
                         break
                     except Exception:
                         self._close_client()
@@ -256,16 +270,35 @@ class SyncManager:
         client_factory: Callable,
         *,
         periodic: bool,
+        prefetch_image: Callable[[str, str, object, float], None] | None = None,
     ) -> None:
         self.accounts = tuple(accounts)
         self.cache = cache
         self.settings = settings
-        self.workers = {
-            account.name: _AccountWorker(account, cache, client_factory)
-            for account in self.accounts
-        }
+        self.prefetch_image = prefetch_image
         self._stop_event = threading.Event()
         self._stopped = False
+        self._prefetch_lock = threading.RLock()
+        self._prefetch_active = False
+        self._prefetch_events = {
+            account.name: threading.Event() for account in self.accounts
+        }
+        self._prefetch_processed = {
+            account.name: set() for account in self.accounts
+        }
+        self._prefetch_failed = {
+            account.name: set() for account in self.accounts
+        }
+        self._prefetch_threads: dict[str, threading.Thread] = {}
+        self.workers = {
+            account.name: _AccountWorker(
+                account,
+                cache,
+                client_factory,
+                self._wake_prefetch,
+            )
+            for account in self.accounts
+        }
         self._scheduler: threading.Thread | None = None
         if periodic and settings.refresh_minutes > 0:
             self._scheduler = threading.Thread(
@@ -280,6 +313,8 @@ class SyncManager:
             return
         self._stopped = True
         self._stop_event.set()
+        for event in self._prefetch_events.values():
+            event.set()
         if self._scheduler is not None:
             self._scheduler.join(timeout=5)
         stopping = [
@@ -287,6 +322,139 @@ class SyncManager:
         ]
         for worker, job in stopping:
             worker.wait_stopped(job)
+        for thread in self._prefetch_threads.values():
+            thread.join(timeout=20)
+
+    def start_prefetch(self) -> None:
+        """Prefetch every cached message newest-first without blocking the caller."""
+
+        if self._stopped or not self.cache.body_cache_enabled:
+            return
+        with self._prefetch_lock:
+            self._prefetch_active = True
+            for account in self.accounts:
+                failed = self._prefetch_failed[account.name]
+                self._prefetch_processed[account.name].difference_update(failed)
+                failed.clear()
+                if account.name not in self._prefetch_threads:
+                    thread = threading.Thread(
+                        target=self._prefetch_account,
+                        args=(account.name,),
+                        name=f"mail-prefetch-{account.name}",
+                        daemon=True,
+                    )
+                    self._prefetch_threads[account.name] = thread
+                    thread.start()
+                self._prefetch_events[account.name].set()
+
+    def restart_prefetch(self) -> None:
+        """Forget completed work after a cache clear and start again."""
+
+        with self._prefetch_lock:
+            for processed in self._prefetch_processed.values():
+                processed.clear()
+            for failed in self._prefetch_failed.values():
+                failed.clear()
+        self.start_prefetch()
+
+    def _wake_prefetch(self, account_name: str) -> None:
+        with self._prefetch_lock:
+            active = self._prefetch_active
+            event = self._prefetch_events.get(account_name)
+            failed = self._prefetch_failed.get(account_name)
+            if failed:
+                self._prefetch_processed[account_name].difference_update(failed)
+                failed.clear()
+        if active and event is not None:
+            event.set()
+
+    def _prefetch_account(self, account_name: str) -> None:
+        event = self._prefetch_events[account_name]
+        while not self._stop_event.is_set():
+            event.wait()
+            event.clear()
+            if self._stop_event.is_set():
+                return
+            while not self._stop_event.is_set():
+                messages = self.cache.query_messages(
+                    (account_name,), unread_only=False, limit=None
+                )
+                with self._prefetch_lock:
+                    processed = self._prefetch_processed[account_name]
+                    pending = [item for item in messages if item.uid not in processed]
+                if not pending:
+                    break
+                restart_order = False
+                for message in pending:
+                    if self._stop_event.is_set():
+                        return
+                    succeeded = self._prefetch_message(
+                        account_name, message.uid, message.received_at
+                    )
+                    with self._prefetch_lock:
+                        self._prefetch_processed[account_name].add(message.uid)
+                        if succeeded:
+                            self._prefetch_failed[account_name].discard(message.uid)
+                        else:
+                            self._prefetch_failed[account_name].add(message.uid)
+                    if event.is_set():
+                        event.clear()
+                        restart_order = True
+                        break
+                if not restart_order:
+                    break
+
+    def _prefetch_message(
+        self, account_name: str, uid: str, received_at: float
+    ) -> bool:
+        try:
+            detail = self.cache.cached_detail(account_name, uid)
+            if not cached_web_body_is_current(detail):
+                detail = self._fetch_prefetch_detail(account_name, uid)
+        except Exception:
+            return False
+        if not cached_web_body_is_current(detail):
+            return False
+        if self.prefetch_image is None:
+            return True
+        succeeded = True
+        for resource in getattr(detail, "image_resources", ()):
+            if self._stop_event.is_set():
+                return False
+            try:
+                self.prefetch_image(account_name, uid, resource, received_at)
+            except Exception:
+                succeeded = False
+        return succeeded
+
+    def _fetch_prefetch_detail(
+        self, account_name: str, uid: str, timeout: float = 30.0
+    ):
+        worker = self.workers.get(account_name)
+        if worker is None:
+            raise RuntimeError(f"unknown account: {account_name}")
+        job = worker.submit(
+            "detail_prefetch",
+            priority=_PREFETCH_DETAIL_PRIORITY,
+            uid=uid,
+            prefer_html=True,
+        )
+        self._wait_for_prefetch_job(job, timeout, "后台缓存邮件正文超时。")
+        if job.error is not None:
+            raise job.error
+        return job.result
+
+    def _wait_for_prefetch_job(
+        self, job: _Job, timeout: float, timeout_message: str
+    ) -> None:
+        deadline = time.monotonic() + timeout
+        while not job.event.is_set():
+            if self._stop_event.is_set():
+                raise RuntimeError("后台缓存已停止。")
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise TimeoutError(timeout_message)
+            job.event.wait(min(0.25, remaining))
 
     def ensure_seed(
         self,
@@ -378,23 +546,29 @@ class SyncManager:
         uid: str,
         resource: object,
         timeout: float = 30.0,
+        *,
+        prefetch: bool = False,
     ):
         worker = self.workers.get(account_name)
         if worker is None:
             raise RuntimeError(f"unknown account: {account_name}")
         job = worker.submit(
-            "image",
-            priority=-9,
+            "image_prefetch" if prefetch else "image",
+            priority=_PREFETCH_IMAGE_PRIORITY if prefetch else -9,
             uid=uid,
             image_resource=resource,
         )
-        if not job.event.wait(timeout):
+        if prefetch:
+            self._wait_for_prefetch_job(job, timeout, "读取邮件图片超时。")
+        elif not job.event.wait(timeout):
             raise TimeoutError("读取邮件图片超时。")
         if job.error is not None:
             raise job.error
         return job.result
 
-    def kick_background(self, limit: int = 30) -> None:
+    def kick_background(
+        self, limit: int = 30, *, incomplete_only: bool = False
+    ) -> None:
         for account in self.accounts:
             state = self.cache.sync_state(account.name)
             if not state.unread_seeded:
@@ -405,7 +579,8 @@ class SyncManager:
                 self.workers[account.name].submit(
                     "seed", priority=3, unread_only=False, limit=limit
                 )
-            self.workers[account.name].submit("sync", priority=5)
+            if not incomplete_only or not state.full_sync_complete:
+                self.workers[account.name].submit("sync", priority=5)
 
     def _wait(
         self, jobs: Iterable[tuple[str, _Job]], timeout: float | None
@@ -428,3 +603,12 @@ class SyncManager:
                 wait=False,
                 force=True,
             )
+
+
+def cached_web_body_is_current(detail: object | None) -> bool:
+    if detail is None or getattr(detail, "html_policy", "") != HTML_POLICY_VERSION:
+        return False
+    body_format = getattr(detail, "body_format", "")
+    return body_format == "plain" or (
+        body_format == "html" and bool(getattr(detail, "safe_html", ""))
+    )

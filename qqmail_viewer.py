@@ -66,7 +66,7 @@ from mail_mime import (
     parse_bodystructure,
     select_body_plan,
 )
-from mail_sync import SyncManager
+from mail_sync import SyncManager, cached_web_body_is_current
 
 
 # Kept as public compatibility constants for integrations that imported them.
@@ -1366,6 +1366,7 @@ class ViewerRuntime:
         self.image_tokens = _ImageTokenStore()
         self.remote_images = RemoteImageFetcher()
         self._image_budget_lock = threading.RLock()
+        self._image_prefetch_slots = threading.BoundedSemaphore(2)
         if key_created and self.settings.cache_mode != "memory":
             self.cache.clear_bodies()
         self.sync = SyncManager(
@@ -1374,6 +1375,7 @@ class ViewerRuntime:
             self.settings,
             configured_client,
             periodic=periodic,
+            prefetch_image=self._prefetch_image_resource,
         )
 
     def close(self) -> None:
@@ -1401,19 +1403,50 @@ class ViewerRuntime:
         if resolved is None:
             raise ViewerError("图片资源已过期，请重新打开邮件。")
         account_name, uid, resource = resolved
+        return self._image_for_resource(account_name, uid, resource)
+
+    def _prefetch_image_resource(
+        self, account_name: str, uid: str, resource: object, received_at: float
+    ) -> None:
+        if not isinstance(resource, dict):
+            raise ViewerError("图片资源无效。")
+        with self._image_prefetch_slots:
+            self._image_for_resource(
+                account_name,
+                uid,
+                resource,
+                prefetch=True,
+                cache_timestamp=received_at,
+            )
+
+    def _image_for_resource(
+        self,
+        account_name: str,
+        uid: str,
+        resource: dict[str, object],
+        *,
+        prefetch: bool = False,
+        cache_timestamp: float | None = None,
+    ):
         resource_id = str(resource.get("id", ""))
         source = str(resource.get("source", ""))
         source_digest = hashlib.sha256(
             json.dumps(resource, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode("utf-8")
         ).hexdigest()
         cached = self.cache.load_image(
-            account_name, uid, resource_id, source_digest=source_digest
+            account_name,
+            uid,
+            resource_id,
+            source_digest=source_digest,
+            touch=not prefetch,
         )
         if cached is not None:
             return cached.mime_type, cached.data
         source_type = str(resource.get("source_type", ""))
         if source_type == "cid":
-            image = self.sync.fetch_image(account_name, uid, resource)
+            image = self.sync.fetch_image(
+                account_name, uid, resource, prefetch=prefetch
+            )
         elif source_type == "remote":
             image = self.remote_images.fetch(source)
         elif source_type == "data":
@@ -1434,6 +1467,15 @@ class ViewerRuntime:
         else:
             raise ViewerError("图片来源无法安全解析。")
         with self._image_budget_lock:
+            cached = self.cache.load_image(
+                account_name,
+                uid,
+                resource_id,
+                source_digest=source_digest,
+                touch=not prefetch,
+            )
+            if cached is not None:
+                return cached.mime_type, cached.data
             current_bytes = self.cache.image_bytes_for_message(account_name, uid)
             if current_bytes + len(image.data) > MAX_MESSAGE_IMAGE_BYTES:
                 raise ViewerError("本邮件图片总量超过安全上限。")
@@ -1445,8 +1487,16 @@ class ViewerRuntime:
                 source_type=source_type,
                 source_digest=source_digest,
                 data=image.data,
+                now=cache_timestamp,
             )
         return image.mime_type, image.data
+
+    def start_prefetch(self) -> None:
+        self.sync.kick_background(DEFAULT_LIMIT, incomplete_only=True)
+        self.sync.start_prefetch()
+
+    def restart_prefetch(self) -> None:
+        self.sync.restart_prefetch()
 
     def reconfigure(
         self,
@@ -1483,7 +1533,10 @@ class ViewerRuntime:
                 self.settings,
                 configured_client,
                 periodic=self.periodic,
+                prefetch_image=self._prefetch_image_resource,
             )
+            if self.periodic:
+                self.sync.start_prefetch()
 
     def message_detail(
         self, account_name: str, uid: str, *, prefer_html: bool = False
@@ -1494,20 +1547,10 @@ class ViewerRuntime:
             cached = self.cache.cached_detail(account_name, uid)
         except RuntimeError as exc:
             raise ViewerError(str(exc)) from exc
-        cached_web_body_is_current = bool(
-            cached is not None
-            and cached.html_policy == HTML_POLICY_VERSION
-            and (
-                cached.body_format == "plain"
-                or (
-                    cached.body_format == "html"
-                    and cached.safe_html
-                )
-            )
-        )
-        if cached is not None and (not prefer_html or cached_web_body_is_current):
+        cached_web_body_current = cached_web_body_is_current(cached)
+        if cached is not None and (not prefer_html or cached_web_body_current):
             cached_has_html = bool(
-                cached_web_body_is_current
+                cached_web_body_current
                 and cached.body_format == "html"
                 and cached.safe_html
             )
@@ -1522,13 +1565,13 @@ class ViewerRuntime:
                 safe_html=cached.safe_html if cached_has_html else "",
                 body_format=cached.body_format,
                 blocked_images=(
-                    cached.blocked_images if cached_web_body_is_current else 0
+                    cached.blocked_images if cached_web_body_current else 0
                 ),
                 html_policy=(
-                    cached.html_policy if cached_web_body_is_current else ""
+                    cached.html_policy if cached_web_body_current else ""
                 ),
                 image_resources=(
-                    cached.image_resources if cached_web_body_is_current else ()
+                    cached.image_resources if cached_web_body_current else ()
                 ),
             )
         fetched: MailDetail | None = None
@@ -2204,6 +2247,9 @@ class ViewerHandler(BaseHTTPRequestHandler):
                     )
                 complete = tuple(name for name in account_names if name not in incomplete)
                 runtime.sync.sync_accounts(complete, wait=False)
+        start_prefetch = getattr(runtime, "start_prefetch", None)
+        if callable(start_prefetch):
+            start_prefetch()
         combined = [*errors, *cached_errors(runtime, account_names)]
         deduplicated: dict[str, dict[str, str]] = {}
         for error in combined:
@@ -2552,14 +2598,14 @@ class ViewerHandler(BaseHTTPRequestHandler):
             for mode, label in (
                 ("memory", "仅内存（退出即清除）"),
                 ("metadata", "仅持久化元数据"),
-                ("body", "加密缓存打开过的正文（默认）"),
+                ("body", "自动加密缓存正文与图片（默认）"),
             )
         )
         token = html.escape(PROCESS_CSRF_TOKEN, quote=True)
         content = f'''<header class="settings-header"><div><h1>缓存与同步设置</h1><p class="account">设置由网页与 CLI 共用，保存在本机系统凭据库中。</p></div><a class="button" href="/">返回邮件列表</a></header>
 <section class="settings-shell">
   {status}
-  <article class="settings-card"><h2>缓存策略</h2><p>邮件列表始终从本地缓存读取；正文只在打开详情时按需获取。</p>
+  <article class="settings-card"><h2>缓存策略</h2><p>邮件列表始终从本地缓存读取；body 和 memory 模式会在进入网页后按日期从新到旧后台缓存正文与正文图片，metadata 模式只保存邮件元数据。远程正文图片可能在邮件尚未打开时向发件方暴露公网 IP 和预取时间。</p>
     <form class="settings-form" method="post" action="/settings">
       <input type="hidden" name="csrf" value="{token}"><input type="hidden" name="action" value="save">
       <div class="form-row"><label class="field-label" for="cache-mode">缓存模式</label><div><select class="select" id="cache-mode" name="cache_mode">{options}</select><span class="form-help">降低模式时，下一步会要求选择是否清除现有缓存。</span></div></div>
@@ -2581,12 +2627,14 @@ class ViewerHandler(BaseHTTPRequestHandler):
         if action == "clear_bodies":
             runtime.cache.clear_bodies()
             runtime.image_tokens.clear()
+            runtime.restart_prefetch()
             self._redirect("/settings?cleared=bodies")
             return
         if action == "clear_all":
             runtime.cache.clear_all()
             runtime.image_tokens.clear()
             runtime.sync.kick_background(DEFAULT_LIMIT)
+            runtime.restart_prefetch()
             self._redirect("/settings?cleared=all")
             return
         if action != "save":
