@@ -533,7 +533,14 @@ AA==
         self.assertIn("window.fetch(url", script)
         self.assertIn("currentMain.replaceWith(nextPage.main)", script)
         self.assertIn("window.history.pushState", script)
-        self.assertIn("Promise.allSettled", script)
+        self.assertNotIn("Promise.allSettled", script)
+        self.assertIn("replacePage(nextPage, true, focusGroup)", script)
+        self.assertIn("void slideTo(nextGroup, source, selected)", script)
+        self.assertLess(
+            script.index("replacePage(nextPage, true, focusGroup)"),
+            script.index("void slideTo(nextGroup, source, selected)"),
+        )
+        self.assertIn('group.classList.remove("is-sliding")', script)
         self.assertEqual(
             handler._send.call_args.kwargs["content_type"],
             "text/javascript; charset=utf-8",

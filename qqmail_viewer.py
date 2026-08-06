@@ -2089,7 +2089,12 @@ BASE_SCRIPT = """
     return Promise.race([
       animation.finished.catch(() => undefined),
       new Promise((resolve) => window.setTimeout(resolve, 320)),
-    ]);
+    ]).finally(() => {
+      slider.remove();
+      group.classList.remove("is-sliding");
+      current.classList.remove("is-transition-source");
+      target.classList.remove("is-transition-target");
+    });
   };
 
   const resizeMessageFrame = (frame) => {
@@ -2360,16 +2365,23 @@ BASE_SCRIPT = """
     navigating = true;
     const currentMain = document.querySelector("main");
     currentMain?.setAttribute("aria-busy", "true");
-    const focusGroup = event.detail === 0 ? group.getAttribute("aria-label") : null;
-    const pageRequest = fetchPage(destination.href);
-    const results = await Promise.allSettled([
-      pageRequest,
-      slideTo(group, current, target),
-    ]);
-    const pageResult = results[0];
+    const groupLabel = group.getAttribute("aria-label");
+    const sourceIndex = Array.from(group.querySelectorAll("a.segment")).indexOf(current);
+    const focusGroup = event.detail === 0 ? groupLabel : null;
     try {
-      if (pageResult.status !== "fulfilled") throw pageResult.reason;
-      replacePage(pageResult.value, true, focusGroup);
+      const nextPage = await fetchPage(destination.href);
+      replacePage(nextPage, true, focusGroup);
+      const nextGroup = Array.from(document.querySelectorAll(".segmented")).find(
+        (item) => item.getAttribute("aria-label") === groupLabel,
+      );
+      const nextSegments = nextGroup
+        ? Array.from(nextGroup.querySelectorAll("a.segment"))
+        : [];
+      const source = nextSegments[sourceIndex];
+      const selected = nextGroup?.querySelector('a.segment[aria-current="page"]');
+      if (nextGroup && source && selected && source !== selected) {
+        void slideTo(nextGroup, source, selected);
+      }
     } catch (_error) {
       window.location.assign(destination.href);
     } finally {
