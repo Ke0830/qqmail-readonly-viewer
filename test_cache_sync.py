@@ -1,5 +1,6 @@
 import io
 import json
+import os
 import sqlite3
 import tempfile
 import time
@@ -9,7 +10,14 @@ from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 import mail_cache
-from mail_cache import CacheSettings, CacheStore, CachedMessage, default_cache_path
+from mail_cache import (
+    BODY_CACHE_ENVELOPE_VERSION,
+    CacheSettings,
+    CacheStore,
+    CachedMessage,
+    default_cache_path,
+)
+from mail_html import HTML_POLICY_VERSION
 from mail_mime import parse_bodystructure, safe_text_parts
 from mail_sync import SyncManager
 from qqmail_viewer import (
@@ -38,6 +46,19 @@ def _summary(uid: str, *, unread: bool = True) -> dict[str, object]:
         "unread": unread,
         "attachments": (),
     }
+
+
+def _legacy_body_ciphertext(
+    key: bytes, account_name: str, uid: str, text: str
+) -> tuple[bytes, bytes]:
+    if mail_cache.AESGCM is None:
+        raise RuntimeError("cryptography is not installed")
+    nonce = os.urandom(12)
+    associated = f"{account_name}:{uid}".encode("utf-8")
+    ciphertext = mail_cache.AESGCM(key).encrypt(
+        nonce, text.encode("utf-8"), associated
+    )
+    return nonce, ciphertext
 
 
 class CacheStoreTests(unittest.TestCase):
@@ -147,18 +168,61 @@ class CacheStoreTests(unittest.TestCase):
             cache = CacheStore(path, CacheSettings("body", 3), key)
             cache.upsert_messages("a", [_summary("1")])
             cache.store_detail(
-                "a", "1", recipients="reader@example.com", text="私密正文", attachments=("a.pdf",)
+                "a",
+                "1",
+                recipients="reader@example.com",
+                text="私密正文",
+                attachments=("a.pdf",),
+                body_format="html",
+                safe_html="<p style=\"color:#123456\">私密正文</p>",
+                blocked_images=2,
+                html_policy=HTML_POLICY_VERSION,
             )
-            raw = cache.connection.execute(
-                "SELECT body_ciphertext FROM messages"
-            ).fetchone()[0]
-            self.assertNotIn("私密正文".encode(), bytes(raw))
+            row = cache.connection.execute(
+                "SELECT body_nonce, body_ciphertext FROM messages"
+            ).fetchone()
+            raw = bytes(row[1])
+            self.assertNotIn("私密正文".encode(), raw)
+            self.assertNotIn(b"safe_html", raw)
+            envelope = json.loads(
+                mail_cache.AESGCM(key)
+                .decrypt(bytes(row[0]), raw, b"a:1:body-v2")
+                .decode("utf-8")
+            )
+            self.assertEqual(
+                envelope,
+                {
+                    "v": BODY_CACHE_ENVELOPE_VERSION,
+                    "policy": HTML_POLICY_VERSION,
+                    "format": "html",
+                    "text": "私密正文",
+                    "safe_html": '<p style="color:#123456">私密正文</p>',
+                    "blocked_images": 2,
+                },
+            )
             cache.close()
 
             reopened = CacheStore(path, CacheSettings("body", 3), key)
             detail = reopened.cached_detail("a", "1")
             self.assertIsNotNone(detail)
-            self.assertEqual((detail.text, detail.attachments), ("私密正文", ("a.pdf",)))
+            self.assertEqual(
+                (
+                    detail.text,
+                    detail.attachments,
+                    detail.body_format,
+                    detail.safe_html,
+                    detail.blocked_images,
+                    detail.html_policy,
+                ),
+                (
+                    "私密正文",
+                    ("a.pdf",),
+                    "html",
+                    '<p style="color:#123456">私密正文</p>',
+                    2,
+                    HTML_POLICY_VERSION,
+                ),
+            )
             reopened.connection.execute(
                 "UPDATE messages SET body_ciphertext=?", (sqlite3.Binary(b"damaged"),)
             )
@@ -168,6 +232,129 @@ class CacheStoreTests(unittest.TestCase):
                 reopened.connection.execute("SELECT body_ciphertext FROM messages").fetchone()[0]
             )
             reopened.close()
+
+    @unittest.skipIf(mail_cache.AESGCM is None, "cryptography is not installed")
+    def test_legacy_plaintext_ciphertext_is_read_as_v1_cache(self):
+        with tempfile.TemporaryDirectory() as directory:
+            cache = CacheStore(
+                Path(directory) / "mail.sqlite3",
+                CacheSettings("body", 3),
+                bytes(range(32)),
+            )
+            cache.upsert_messages("a", [_summary("1")])
+            nonce, ciphertext = _legacy_body_ciphertext(
+                bytes(range(32)), "a", "1", "旧版纯文本正文"
+            )
+            cache.connection.execute(
+                """
+                UPDATE messages SET attachments_json=?, body_nonce=?, body_ciphertext=?
+                WHERE account_name=? AND uid=?
+                """,
+                (
+                    '["legacy.pdf"]',
+                    sqlite3.Binary(nonce),
+                    sqlite3.Binary(ciphertext),
+                    "a",
+                    1,
+                ),
+            )
+            cache.connection.commit()
+
+            detail = cache.cached_detail("a", "1")
+            self.assertIsNotNone(detail)
+            self.assertEqual(detail.text, "旧版纯文本正文")
+            self.assertEqual(detail.attachments, ("legacy.pdf",))
+            self.assertEqual(detail.body_format, "plain")
+            self.assertEqual(detail.safe_html, "")
+            self.assertEqual(detail.blocked_images, 0)
+            self.assertEqual(detail.html_policy, "")
+            cache.close()
+
+    @unittest.skipIf(mail_cache.AESGCM is None, "cryptography is not installed")
+    def test_legacy_ciphertext_that_looks_like_v2_remains_plain_text(self):
+        with tempfile.TemporaryDirectory() as directory:
+            key = bytes(range(32))
+            cache = CacheStore(
+                Path(directory) / "mail.sqlite3",
+                CacheSettings("body", 3),
+                key,
+            )
+            cache.upsert_messages("a", [_summary("1")])
+            v2_shaped_text = json.dumps(
+                {
+                    "v": BODY_CACHE_ENVELOPE_VERSION,
+                    "policy": HTML_POLICY_VERSION,
+                    "format": "html",
+                    "text": "伪装正文",
+                    "safe_html": "<script>alert(1)</script>",
+                    "blocked_images": 4,
+                },
+                ensure_ascii=False,
+                separators=(",", ":"),
+            )
+            nonce, ciphertext = _legacy_body_ciphertext(
+                key, "a", "1", v2_shaped_text
+            )
+            cache.connection.execute(
+                """
+                UPDATE messages SET body_nonce=?, body_ciphertext=?
+                WHERE account_name=? AND uid=?
+                """,
+                (
+                    sqlite3.Binary(nonce),
+                    sqlite3.Binary(ciphertext),
+                    "a",
+                    1,
+                ),
+            )
+            cache.connection.commit()
+
+            detail = cache.cached_detail("a", "1")
+
+            self.assertIsNotNone(detail)
+            self.assertEqual(detail.text, v2_shaped_text)
+            self.assertEqual(detail.body_format, "plain")
+            self.assertEqual(detail.safe_html, "")
+            self.assertEqual(detail.blocked_images, 0)
+            self.assertEqual(detail.html_policy, "")
+            cache.close()
+
+    @unittest.skipIf(mail_cache.AESGCM is None, "cryptography is not installed")
+    def test_authenticated_but_invalid_v2_envelope_is_deleted(self):
+        with tempfile.TemporaryDirectory() as directory:
+            key = bytes(range(32))
+            cache = CacheStore(
+                Path(directory) / "mail.sqlite3",
+                CacheSettings("body", 3),
+                key,
+            )
+            cache.upsert_messages("a", [_summary("1")])
+            nonce = os.urandom(12)
+            ciphertext = mail_cache.AESGCM(key).encrypt(
+                nonce,
+                b"not-a-versioned-json-envelope",
+                b"a:1:body-v2",
+            )
+            cache.connection.execute(
+                """
+                UPDATE messages SET body_nonce=?, body_ciphertext=?
+                WHERE account_name=? AND uid=?
+                """,
+                (
+                    sqlite3.Binary(nonce),
+                    sqlite3.Binary(ciphertext),
+                    "a",
+                    1,
+                ),
+            )
+            cache.connection.commit()
+
+            self.assertIsNone(cache.cached_detail("a", "1"))
+            row = cache.connection.execute(
+                "SELECT body_nonce, body_ciphertext FROM messages"
+            ).fetchone()
+            self.assertEqual(tuple(row), (None, None))
+            cache.close()
 
     def test_encrypted_body_cache_wiring_without_external_dependency(self):
         class TestAEAD:
@@ -222,6 +409,138 @@ class CacheStoreTests(unittest.TestCase):
             replacement, replaced = _cache_encryption_key()
             self.assertTrue(replaced)
             self.assertEqual(len(replacement), 32)
+
+
+class RichBodyCacheRuntimeTests(unittest.TestCase):
+    @unittest.skipIf(mail_cache.AESGCM is None, "cryptography is not installed")
+    def test_current_policy_plain_cache_satisfies_web_detail_without_refetch(self):
+        with tempfile.TemporaryDirectory() as directory:
+            cache = CacheStore(
+                Path(directory) / "mail.sqlite3",
+                CacheSettings("body", 3),
+                bytes(range(32)),
+            )
+            cache.upsert_messages("a", [_summary("1")])
+            cache.store_detail(
+                "a",
+                "1",
+                recipients="reader@example.com",
+                text="已确认没有安全 HTML 的纯文本",
+                attachments=("note.txt",),
+                body_format="plain",
+                html_policy=HTML_POLICY_VERSION,
+            )
+            fetch_detail = MagicMock()
+            runtime = object.__new__(ViewerRuntime)
+            runtime.cache = cache
+            runtime.sync = SimpleNamespace(fetch_detail=fetch_detail)
+
+            detail = runtime.message_detail("a", "1", prefer_html=True)
+
+            self.assertEqual(detail.text, "已确认没有安全 HTML 的纯文本")
+            self.assertEqual(detail.attachments, ("note.txt",))
+            self.assertEqual(detail.body_format, "plain")
+            self.assertEqual(detail.html_policy, HTML_POLICY_VERSION)
+            fetch_detail.assert_not_called()
+            cache.close()
+
+    @unittest.skipIf(mail_cache.AESGCM is None, "cryptography is not installed")
+    def test_legacy_and_stale_policy_cache_refetch_html_for_web(self):
+        with tempfile.TemporaryDirectory() as directory:
+            cache = CacheStore(
+                Path(directory) / "mail.sqlite3",
+                CacheSettings("body", 3),
+                bytes(range(32)),
+            )
+            cache.upsert_messages("a", [_summary("1"), _summary("2")])
+            legacy_nonce, legacy_ciphertext = _legacy_body_ciphertext(
+                bytes(range(32)), "a", "1", "旧版纯文本"
+            )
+            cache.connection.execute(
+                """
+                UPDATE messages SET body_nonce=?, body_ciphertext=?
+                WHERE account_name=? AND uid=?
+                """,
+                (
+                    sqlite3.Binary(legacy_nonce),
+                    sqlite3.Binary(legacy_ciphertext),
+                    "a",
+                    1,
+                ),
+            )
+            cache.connection.commit()
+            cache.store_detail(
+                "a",
+                "2",
+                recipients="reader@example.com",
+                text="旧策略正文",
+                attachments=(),
+                body_format="plain",
+                html_policy="mail-html-v0",
+            )
+
+            refreshed = {
+                uid: SimpleNamespace(uid=uid, text=f"新正文 {uid}")
+                for uid in ("1", "2")
+            }
+            fetch_detail = MagicMock(
+                side_effect=lambda account, uid, *, prefer_html: refreshed[uid]
+            )
+            runtime = object.__new__(ViewerRuntime)
+            runtime.cache = cache
+            runtime.sync = SimpleNamespace(fetch_detail=fetch_detail)
+
+            self.assertIs(runtime.message_detail("a", "1", prefer_html=True), refreshed["1"])
+            self.assertIs(runtime.message_detail("a", "2", prefer_html=True), refreshed["2"])
+            self.assertEqual(
+                [item.args for item in fetch_detail.call_args_list],
+                [("a", "1"), ("a", "2")],
+            )
+            self.assertTrue(
+                all(
+                    item.kwargs == {"prefer_html": True}
+                    for item in fetch_detail.call_args_list
+                )
+            )
+            cache.close()
+
+    @unittest.skipIf(mail_cache.AESGCM is None, "cryptography is not installed")
+    def test_failed_rich_refresh_falls_back_to_stale_plain_cache(self):
+        with tempfile.TemporaryDirectory() as directory:
+            cache = CacheStore(
+                Path(directory) / "mail.sqlite3",
+                CacheSettings("body", 3),
+                bytes(range(32)),
+            )
+            cache.upsert_messages("a", [_summary("1")])
+            cache.store_detail(
+                "a",
+                "1",
+                recipients="old-reader@example.com",
+                text="仍可阅读的旧纯文本",
+                attachments=("old.pdf",),
+                body_format="plain",
+                html_policy="mail-html-v0",
+            )
+            failed = SimpleNamespace(
+                cacheable=False,
+                body_format="unavailable",
+                recipients="new-reader@example.com",
+                attachments=("new.pdf",),
+            )
+            runtime = object.__new__(ViewerRuntime)
+            runtime.cache = cache
+            runtime.sync = SimpleNamespace(
+                fetch_detail=MagicMock(return_value=failed)
+            )
+
+            detail = runtime.message_detail("a", "1", prefer_html=True)
+
+            self.assertEqual(detail.text, "仍可阅读的旧纯文本")
+            self.assertEqual(detail.recipients, "new-reader@example.com")
+            self.assertEqual(detail.attachments, ("new.pdf",))
+            self.assertEqual(detail.body_format, "plain")
+            cache.close()
 
 
 class MimeSectionTests(unittest.TestCase):
@@ -323,6 +642,7 @@ class _RemoteState:
         self.delay = delay
         self.priority_calls: list[tuple[bool, int]] = []
         self.fetch_calls: list[list[str]] = []
+        self.detail_calls: list[tuple[str, bool]] = []
         self.connects = 0
         self.noops = 0
 
@@ -361,7 +681,8 @@ class _WorkerClient:
         unread = self.state.unseen if unread_uids is None else unread_uids
         return [_summary(uid, unread=uid in unread) for uid in values]
 
-    def get_message(self, uid):
+    def get_message(self, uid, *, prefer_html=False):
+        self.state.detail_calls.append((str(uid), prefer_html))
         return SimpleNamespace(
             uid=uid,
             subject=f"message {uid}",
@@ -511,6 +832,100 @@ class SyncManagerTests(unittest.TestCase):
             self.assertFalse(manager.sync_accounts(("a",), wait=True, force=True))
             self.assertEqual(factory_calls, 3)
             self.assertEqual(cache.account_uids("a"), {"1"})
+            manager.stop()
+            cache.close()
+
+    def test_detail_worker_forwards_prefer_html_to_account_client(self):
+        account = SimpleNamespace(name="a")
+        state = _RemoteState(["1"], {"1"})
+        with tempfile.TemporaryDirectory() as directory:
+            cache = self._cache(directory)
+            manager = SyncManager(
+                (account,),
+                cache,
+                CacheSettings("metadata", 3),
+                lambda _account: _WorkerClient(state),
+                periodic=False,
+            )
+
+            detail = manager.fetch_detail("a", "1", prefer_html=True)
+
+            self.assertEqual(detail.text, "body")
+            self.assertEqual(state.detail_calls, [("1", True)])
+            manager.stop()
+            cache.close()
+
+    @unittest.skipIf(mail_cache.AESGCM is None, "cryptography is not installed")
+    def test_failed_detail_preserves_existing_body_and_attachments_without_caching_error(self):
+        account = SimpleNamespace(name="a")
+        state = _RemoteState(["1", "2"], {"1", "2"})
+
+        class FailedDetailClient(_WorkerClient):
+            def get_message(self, uid, *, prefer_html=False):
+                self.state.detail_calls.append((str(uid), prefer_html))
+                return SimpleNamespace(
+                    uid=str(uid),
+                    subject=f"message {uid}",
+                    sender="sender@example.com",
+                    recipients="reader@example.com",
+                    date="2026-08-05 10:00",
+                    text="为避免下载附件，正文无法安全读取",
+                    attachments=(),
+                    body_format="unavailable",
+                    safe_html="",
+                    blocked_images=0,
+                    html_policy="",
+                    cacheable=False,
+                )
+
+        with tempfile.TemporaryDirectory() as directory:
+            cache = CacheStore(
+                Path(directory) / "mail.sqlite3",
+                CacheSettings("body", 3),
+                bytes(range(32)),
+            )
+            first = _summary("1")
+            first["attachments"] = ("existing.pdf",)
+            second = _summary("2")
+            second["attachments"] = ("uncached.zip",)
+            cache.upsert_messages("a", [first, second])
+            cache.store_detail(
+                "a",
+                "1",
+                recipients="reader@example.com",
+                text="原有正文",
+                attachments=("existing.pdf",),
+                body_format="plain",
+                html_policy=HTML_POLICY_VERSION,
+            )
+            manager = SyncManager(
+                (account,),
+                cache,
+                CacheSettings("body", 3),
+                lambda _account: FailedDetailClient(state),
+                periodic=False,
+            )
+
+            manager.fetch_detail("a", "1", prefer_html=True)
+            manager.fetch_detail("a", "2", prefer_html=True)
+
+            existing = cache.cached_detail("a", "1")
+            self.assertIsNotNone(existing)
+            self.assertEqual(existing.text, "原有正文")
+            self.assertEqual(existing.attachments, ("existing.pdf",))
+            self.assertIsNone(cache.cached_detail("a", "2"))
+            rows = cache.connection.execute(
+                """
+                SELECT uid, attachments_json, body_ciphertext
+                FROM messages WHERE account_name=? ORDER BY uid
+                """,
+                ("a",),
+            ).fetchall()
+            self.assertEqual(json.loads(rows[0][1]), ["existing.pdf"])
+            self.assertIsNotNone(rows[0][2])
+            self.assertEqual(json.loads(rows[1][1]), ["uncached.zip"])
+            self.assertIsNone(rows[1][2])
+            self.assertEqual(state.detail_calls, [("1", True), ("2", True)])
             manager.stop()
             cache.close()
 

@@ -21,6 +21,7 @@ class _Job:
     unread_only: bool = field(default=False, compare=False)
     limit: int = field(default=30, compare=False)
     uid: str = field(default="", compare=False)
+    prefer_html: bool = field(default=False, compare=False)
     event: threading.Event = field(default_factory=threading.Event, compare=False)
     result: object = field(default=None, compare=False)
     error: Exception | None = field(default=None, compare=False)
@@ -52,20 +53,22 @@ class _AccountWorker:
         unread_only: bool = False,
         limit: int = 30,
         uid: str = "",
+        prefer_html: bool = False,
     ) -> _Job:
-        key = f"{kind}:{int(unread_only)}:{limit}:{uid}"
+        key = f"{kind}:{int(unread_only)}:{limit}:{uid}:{int(prefer_html)}"
         with self._pending_lock:
             existing = self._pending.get(key)
             if existing is not None:
                 return existing
             job = _Job(
-                priority,
-                next(self._sequence),
-                key,
-                kind,
-                unread_only,
-                limit,
-                uid,
+                priority=priority,
+                sequence=next(self._sequence),
+                key=key,
+                kind=kind,
+                unread_only=unread_only,
+                limit=limit,
+                uid=uid,
+                prefer_html=prefer_html,
             )
             self._pending[key] = job
             self.jobs.put(job)
@@ -103,7 +106,9 @@ class _AccountWorker:
                         elif job.kind in {"sync", "sync_urgent"}:
                             job.result = self._sync(client)
                         elif job.kind == "detail":
-                            job.result = self._detail(client, job.uid)
+                            job.result = self._detail(
+                                client, job.uid, prefer_html=job.prefer_html
+                            )
                         else:
                             raise RuntimeError(f"unknown sync job: {job.kind}")
                         break
@@ -194,19 +199,37 @@ class _AccountWorker:
         )
         return len(missing)
 
-    def _detail(self, client, uid: str):
+    def _detail(self, client, uid: str, *, prefer_html: bool = False):
         if self._stop_event.is_set():
             raise RuntimeError("读取邮件正文已停止。")
         if self.cache.message(self.account.name, uid) is None:
             summaries = client.fetch_summaries([uid])
             self.cache.upsert_messages(self.account.name, summaries)
-        detail = client.get_message(uid)
+        detail = client.get_message(uid, prefer_html=prefer_html)
+        body_format = str(getattr(detail, "body_format", "plain"))
+        text = str(detail.text)
+        safe_html = str(getattr(detail, "safe_html", ""))
+        html_policy = str(getattr(detail, "html_policy", ""))
+        raw_blocked_images = getattr(detail, "blocked_images", 0)
+        blocked_images = (
+            raw_blocked_images
+            if type(raw_blocked_images) is int and raw_blocked_images >= 0
+            else 0
+        )
+        cacheable = bool(
+            getattr(detail, "cacheable", body_format in {"plain", "html"})
+        )
         self.cache.store_detail(
             self.account.name,
             uid,
             recipients=detail.recipients,
-            text=detail.text,
+            text=text,
             attachments=detail.attachments,
+            body_format=body_format,
+            safe_html=safe_html,
+            blocked_images=blocked_images,
+            html_policy=html_policy,
+            cacheable=cacheable,
         )
         return detail
 
@@ -318,11 +341,20 @@ class SyncManager:
             return ()
         return self._wait(jobs, timeout)
 
-    def fetch_detail(self, account_name: str, uid: str, timeout: float = 30.0):
+    def fetch_detail(
+        self,
+        account_name: str,
+        uid: str,
+        timeout: float = 30.0,
+        *,
+        prefer_html: bool = False,
+    ):
         worker = self.workers.get(account_name)
         if worker is None:
             raise RuntimeError(f"unknown account: {account_name}")
-        job = worker.submit("detail", priority=-10, uid=uid)
+        job = worker.submit(
+            "detail", priority=-10, uid=uid, prefer_html=prefer_html
+        )
         if not job.event.wait(timeout):
             raise TimeoutError("读取邮件正文超时。")
         if job.error is not None:

@@ -328,11 +328,44 @@ AA==
 
         with patch(
             "qqmail_viewer.cached_page",
-            return_value=(page_data, (SimpleNamespace(message=summary, account=accounts[1]),)),
+            return_value=(
+                page_data,
+                (SimpleNamespace(message=summary, account=accounts[1], unread=True),),
+            ),
         ):
             handler._home({"account": ["all"], "unread": ["0"], "limit": ["30"], "page": ["1"]})
 
         body = handler._send.call_args.args[0].decode("utf-8")
+        self.assertIn("<title>本地邮箱查看器</title>", body)
+        self.assertIn("<h1>本地邮箱查看器</h1>", body)
+        self.assertNotIn("<h1>本地只读邮箱查看器</h1>", body)
+        self.assertIn(
+            '<p class="account-summary" aria-label="已添加邮箱，共 2 个">'
+            '<strong class="account-summary-name">已添加邮箱</strong>'
+            '<span class="account-summary-count">（2 个）</span></p>',
+            body,
+        )
+        self.assertNotIn("当前范围", body)
+        self.assertIn("全部（2）", body)
+        self.assertIn(">QQ</a>", body)
+        self.assertIn(">Gmail</a>", body)
+        self.assertIn(
+            '<span class="state-stat state-total">共 1 封</span>', body
+        )
+        self.assertIn(
+            '<span class="state-stat state-range">显示第 1–1 封</span>', body
+        )
+        self.assertIn(
+            '<span class="state-stat state-page">第 1 / 1 页</span>', body
+        )
+        self.assertIn(
+            '<span class="state-stat state-sort">按日期倒序</span>', body
+        )
+        self.assertLess(body.index("state-page"), body.index("state-sort"))
+        self.assertIn(
+            ".state-text{display:grid;grid-template-columns:72px 132px 96px max-content",
+            body,
+        )
         self.assertIn("全部账户", body)
         self.assertIn("account=qq", body)
         self.assertIn("account=gmail", body)
@@ -348,13 +381,29 @@ AA==
         self.assertIn('<script src="/assets/viewer.js" defer></script>', body)
         self.assertNotIn("window.fetch(url", body)
         self.assertNotIn("@view-transition", body)
+        self.assertIn('<span class="sender-name">Person</span>', body)
+        self.assertIn(
+            '<span class="mail-address-label">发件邮箱</span>'
+            '<span class="sender-address">person@example.com</span>',
+            body,
+        )
+        self.assertIn(
+            '<span class="mail-address-label">收件账户</span>'
+            '<span class="account-tag">gmail · b@gmail.com</span>',
+            body,
+        )
         self.assertIn("gmail · b@gmail.com", body)
+        self.assertIn('class="mail mail-unread"', body)
+        self.assertIn('<span class="message-status">未读</span>', body)
         self.assertIn("账户 qq 暂时无法读取", body)
         self.assertIn("return_account=all", body)
 
         with patch(
             "qqmail_viewer.cached_page",
-            return_value=(page_data, (SimpleNamespace(message=summary, account=accounts[1]),)),
+            return_value=(
+                page_data,
+                (SimpleNamespace(message=summary, account=accounts[1], unread=True),),
+            ),
         ):
             for selected_limit in (50, 100):
                 handler._home(
@@ -376,6 +425,100 @@ AA==
                 self.assertLess(
                     selected_body.index(">50</a>"), selected_body.index(">100</a>")
                 )
+
+    def test_all_mail_view_labels_read_and_unread_without_cluttering_unread_view(self):
+        from qqmail_viewer import MailPage, MailSummary
+
+        account = Account(
+            "qq", "qq", "a@qq.com", "imap.qq.com", 993, "email-a", "auth-a", True
+        )
+        unread = MailSummary("9", "Unread subject", "Unread sender", "2026-08-05 12:00", 1)
+        read = MailSummary("8", "Read subject", "Read sender", "2026-08-05 11:00", 1)
+        handler = object.__new__(ViewerHandler)
+        handler._send = MagicMock()
+        handler._runtime = MagicMock(
+            return_value=SimpleNamespace(
+                accounts=(account,),
+                cache=SimpleNamespace(
+                    sync_state=lambda name: SimpleNamespace(full_sync_complete=True)
+                ),
+            )
+        )
+        handler._prepare_cache = MagicMock(return_value=())
+        page_data = MailPage((unread, read), 2, 0, 30)
+        owned = (
+            SimpleNamespace(message=unread, account=account, unread=True),
+            SimpleNamespace(message=read, account=account, unread=False),
+        )
+
+        with patch("qqmail_viewer.cached_page", return_value=(page_data, owned)):
+            handler._home(
+                {"account": ["qq"], "unread": ["0"], "limit": ["30"], "page": ["1"]}
+            )
+
+        body = handler._send.call_args.args[0].decode("utf-8")
+        self.assertIn(
+            '<p class="account-summary"><strong class="account-summary-name" '
+            'title="QQ">QQ</strong><span class="account-summary-separator" '
+            'aria-hidden="true">·</span><span class="account-summary-detail" '
+            'title="a@qq.com">a@qq.com</span></p>',
+            body,
+        )
+        self.assertIn('class="mail mail-unread"', body)
+        self.assertIn('class="mail mail-read"', body)
+        self.assertIn(
+            '<section class="mailbox mailbox-with-status" aria-label="全部邮件列表">',
+            body,
+        )
+        self.assertIn(
+            '<div class="list-head"><span>发件人</span><span>主题</span>'
+            '<span class="status-head">状态</span><span>日期</span></div>',
+            body,
+        )
+        self.assertIn(
+            '<span class="subject"><span class="subject-text">Unread subject</span>'
+            '</span><span class="message-status">未读</span>',
+            body,
+        )
+        self.assertIn('<span class="message-status">未读</span>', body)
+        self.assertIn('<span class="message-status">已读</span>', body)
+
+        unread_page = MailPage((unread,), 1, 0, 30)
+        with patch(
+            "qqmail_viewer.cached_page",
+            return_value=(
+                unread_page,
+                (SimpleNamespace(message=unread, account=account, unread=True),),
+            ),
+        ):
+            handler._home(
+                {"account": ["qq"], "unread": ["1"], "limit": ["30"], "page": ["1"]}
+            )
+
+        unread_body = handler._send.call_args.args[0].decode("utf-8")
+        self.assertIn(
+            '<section class="mailbox" aria-label="未读邮件列表">', unread_body
+        )
+        self.assertNotIn(
+            '<section class="mailbox mailbox-with-status"', unread_body
+        )
+        self.assertNotIn('class="status-head"', unread_body)
+        self.assertNotIn('<span class="message-status">', unread_body)
+        self.assertNotIn('class="mail mail-unread"', unread_body)
+        self.assertNotIn('class="mail mail-read"', unread_body)
+        self.assertNotIn("收件账户", unread_body)
+
+    def test_sender_parts_keeps_a_bare_email_available_for_explicit_labeling(self):
+        from qqmail_viewer import sender_parts
+
+        self.assertEqual(
+            sender_parts("Person <person@example.com>"),
+            ("Person", "person@example.com"),
+        )
+        self.assertEqual(
+            sender_parts("person@example.com"), ("", "person@example.com")
+        )
+        self.assertEqual(sender_parts("小可"), ("小可", ""))
 
     def test_serves_slider_script_and_allows_only_same_origin_script_and_fetch(self):
         handler = object.__new__(ViewerHandler)

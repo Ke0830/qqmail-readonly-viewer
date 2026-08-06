@@ -42,12 +42,20 @@ from mail_cache import (
     CachedMessage,
     default_cache_path,
 )
+from mail_html import (
+    HTML_POLICY_VERSION,
+    MAX_INPUT_BYTES,
+    MAX_OUTPUT_BYTES,
+    HtmlSanitizationError,
+    normalize_plain_text,
+    sanitize_email_html,
+)
 from mail_mime import (
     BodyStructureError,
     decode_transfer,
     extract_fetch_payload,
     parse_bodystructure,
-    safe_text_parts,
+    select_body_plan,
 )
 from mail_sync import SyncManager
 
@@ -64,8 +72,17 @@ CACHE_KEY_SERVICE = "codex.qqmail-viewer.cache-encryption-key.v1"
 PROCESS_CSRF_TOKEN = secrets.token_urlsafe(32)
 DEFAULT_LIMIT = 30
 MAX_LIMIT = 100
+APP_TITLE = "本地邮箱查看器"
 CHINA_TIMEZONE = timezone(timedelta(hours=8))
 NETEASE_IMAP_HOSTS = frozenset({"imap.163.com", "imap.126.com", "imap.yeah.net"})
+PROVIDER_TAB_LABELS = {
+    "qq": "QQ",
+    "163": "163",
+    "126": "126",
+    "yeah": "yeah",
+    "icloud": "iCloud",
+    "gmail": "Gmail",
+}
 
 
 class ViewerError(RuntimeError):
@@ -128,6 +145,7 @@ class AccountMailSummary:
 
     account: Account
     message: "MailSummary"
+    unread: bool | None = None
 
 
 def _configure_standard_streams() -> None:
@@ -165,10 +183,7 @@ class _TextExtractor(HTMLParser):
             self.parts.append(data)
 
     def text(self) -> str:
-        value = html.unescape("".join(self.parts))
-        value = re.sub(r"[ \t]+", " ", value)
-        value = re.sub(r"\n{3,}", "\n\n", value)
-        return value.strip()
+        return normalize_plain_text("".join(self.parts))
 
 
 @dataclass(frozen=True)
@@ -189,6 +204,11 @@ class MailDetail:
     date: str
     text: str
     attachments: tuple[str, ...]
+    safe_html: str = ""
+    body_format: str = "plain"
+    blocked_images: int = 0
+    html_policy: str = ""
+    cacheable: bool = True
 
 
 @dataclass(frozen=True)
@@ -259,8 +279,8 @@ def listing_url(unread_only: bool, limit: int, offset: int, account: str | None 
 def sender_parts(sender: str) -> tuple[str, str]:
     """Split a decoded From header into a readable name and address."""
     name, address = parseaddr(sender)
-    if address:
-        return (name or address, address if name else "")
+    if address and "@" in address:
+        return (name, address)
     return (sender or "（未知发件人）", "")
 
 
@@ -823,8 +843,13 @@ class QQMailClient:
                 )
                 attachments: tuple[str, ...] = ()
                 try:
-                    _, names = safe_text_parts(parse_bodystructure([row]))
-                    attachments = tuple(decode_mime(name) or "未命名附件" for name in names)
+                    plan = select_body_plan(
+                        parse_bodystructure([row]), prefer_html=False
+                    )
+                    attachments = tuple(
+                        decode_mime(name) or "未命名附件"
+                        for name in plan.attachments
+                    )
                 except BodyStructureError:
                     pass
                 summaries.append(
@@ -888,7 +913,7 @@ class QQMailClient:
         effective_offset = min(max(offset, 0), last_offset)
         return MailPage(tuple(messages[effective_offset : effective_offset + limit]), total, effective_offset, limit)
 
-    def get_message(self, uid: str) -> MailDetail:
+    def get_message(self, uid: str, *, prefer_html: bool = False) -> MailDetail:
         if not uid.isdigit():
             raise ViewerError("邮件 UID 无效。")
         status, header_rows = self._imap().uid(
@@ -900,44 +925,129 @@ class QQMailClient:
         if not header_bytes:
             raise ViewerError("邮件不存在或已被移动。")
         parsed = email.message_from_bytes(header_bytes)
-        text = ""
+        text = "为避免下载附件，正文无法安全读取"
         attachments: tuple[str, ...] = ()
+        safe_html = ""
+        body_format = "unavailable"
+        blocked_images = 0
+        html_policy = ""
+        cacheable = False
         try:
             structure_status, structure_rows = self._imap().uid(
                 "fetch", uid, "(BODYSTRUCTURE)"
             )
             if structure_status != "OK":
-                raise BodyStructureError("BODYSTRUCTURE fetch failed")
-            text_parts, raw_attachments = safe_text_parts(
-                parse_bodystructure(structure_rows)
+                raise ViewerError("无法读取邮件结构。")
+            plan = select_body_plan(
+                parse_bodystructure(structure_rows), prefer_html=prefer_html
             )
             attachments = tuple(
-                decode_mime(name) or "未命名附件" for name in raw_attachments
+                decode_mime(name) or "未命名附件" for name in plan.attachments
             )
-            decoded_parts: list[str] = []
-            html_selected = bool(text_parts) and all(
-                part.content_type == "text/html" for part in text_parts
+            inline_images = sum(
+                part.content_type.startswith("image/")
+                for part in plan.inline_resources
             )
-            for part in text_parts:
-                payload_status, payload_rows = self._imap().uid(
-                    "fetch", uid, f"(BODY.PEEK[{part.section}])"
+            transport_error: ViewerError | None = None
+            html_transport_failed = False
+            empty_candidate_seen = False
+            empty_blocked_images = 0
+            unsafe_candidate_failed = False
+            for candidate in (plan.primary, plan.fallback):
+                if not candidate:
+                    continue
+                html_selected = all(
+                    part.content_type == "text/html" for part in candidate
                 )
-                if payload_status != "OK":
-                    raise BodyStructureError("safe MIME section fetch failed")
-                payload = decode_transfer(
-                    extract_fetch_payload(payload_rows), part.encoding
-                )
-                decoded_parts.append(decode_bytes(payload, part.charset))
-            if html_selected:
-                extractor = _TextExtractor()
-                extractor.feed("\n".join(decoded_parts))
-                text = extractor.text()
-            else:
-                text = "\n\n".join(decoded_parts)
-            text = text.replace("\r\n", "\n").replace("\r", "\n")
-            text = re.sub(r"\n{4,}", "\n\n\n", text).strip()
+                try:
+                    decoded_parts: list[str] = []
+                    for part in candidate:
+                        if part.octets is not None and part.octets > MAX_INPUT_BYTES:
+                            raise HtmlSanitizationError("邮件正文超过安全读取上限")
+                        payload_status, payload_rows = self._imap().uid(
+                            "fetch", uid, f"(BODY.PEEK[{part.section}])"
+                        )
+                        if payload_status != "OK":
+                            raise ViewerError("无法读取邮件正文。")
+                        raw_payload = extract_fetch_payload(payload_rows)
+                        if part.octets and not raw_payload:
+                            raise ViewerError("无法读取邮件正文。")
+                        if len(raw_payload) > MAX_INPUT_BYTES:
+                            raise HtmlSanitizationError("邮件正文超过安全读取上限")
+                        payload = decode_transfer(raw_payload, part.encoding)
+                        if len(payload) > MAX_INPUT_BYTES:
+                            raise HtmlSanitizationError("邮件正文超过安全读取上限")
+                        decoded = decode_bytes(payload, part.charset)
+                        if len(decoded.encode("utf-8")) > MAX_INPUT_BYTES:
+                            raise HtmlSanitizationError("邮件正文超过安全读取上限")
+                        decoded_parts.append(decoded)
+
+                    if html_selected:
+                        sanitized = sanitize_email_html("\n".join(decoded_parts))
+                        candidate_text = sanitized.plain_text
+                        candidate_html = sanitized.safe_html.strip()
+                        candidate_blocked_images = max(
+                            sanitized.blocked_images, inline_images
+                        )
+                        if not candidate_html or (
+                            not candidate_text
+                            and "mail-image-placeholder" not in candidate_html
+                        ):
+                            empty_candidate_seen = True
+                            empty_blocked_images = max(
+                                empty_blocked_images,
+                                candidate_blocked_images,
+                            )
+                            continue
+                        text = candidate_text
+                        safe_html = candidate_html
+                        body_format = "html"
+                        blocked_images = candidate_blocked_images
+                        html_policy = HTML_POLICY_VERSION
+                    elif all(
+                        part.content_type == "text/plain" for part in candidate
+                    ):
+                        candidate_text = normalize_plain_text(
+                            "\n\n".join(decoded_parts)
+                        )
+                        if len(candidate_text.encode("utf-8")) > MAX_OUTPUT_BYTES:
+                            raise HtmlSanitizationError(
+                                "纯文本正文超过安全显示上限"
+                            )
+                        if not candidate_text:
+                            empty_candidate_seen = True
+                            continue
+                        text = candidate_text
+                        body_format = "plain"
+                        if prefer_html and not html_transport_failed:
+                            html_policy = HTML_POLICY_VERSION
+                    else:
+                        raise BodyStructureError("mixed safe body candidate")
+                    cacheable = True
+                    break
+                except ViewerError as exc:
+                    transport_error = exc
+                    if html_selected:
+                        html_transport_failed = True
+                except (HtmlSanitizationError, BodyStructureError, ValueError, TypeError):
+                    unsafe_candidate_failed = True
+                    continue
+
+            if not cacheable:
+                if transport_error is not None:
+                    raise transport_error
+                if empty_candidate_seen and not unsafe_candidate_failed:
+                    text = ""
+                    body_format = "plain"
+                    blocked_images = empty_blocked_images
+                    html_policy = HTML_POLICY_VERSION if prefer_html else ""
+                    cacheable = True
+                elif plan.blocked_reason == "encrypted":
+                    text = "这封邮件的正文已加密，当前无法安全读取"
+        except ViewerError:
+            raise
         except (BodyStructureError, ValueError, TypeError):
-            text = "为避免下载附件，正文无法安全读取"
+            pass
         return MailDetail(
             uid=uid,
             subject=decode_mime(parsed.get("Subject")) or "（无主题）",
@@ -946,6 +1056,11 @@ class QQMailClient:
             date=normalize_date(parsed.get("Date")),
             text=text,
             attachments=attachments,
+            safe_html=safe_html,
+            body_format=body_format,
+            blocked_images=blocked_images,
+            html_policy=html_policy,
+            cacheable=cacheable,
         )
 
 
@@ -1152,14 +1267,32 @@ class ViewerRuntime:
                 periodic=self.periodic,
             )
 
-    def message_detail(self, account_name: str, uid: str) -> MailDetail:
+    def message_detail(
+        self, account_name: str, uid: str, *, prefer_html: bool = False
+    ) -> MailDetail:
         if not uid.isdigit():
             raise ViewerError("邮件 UID 无效。")
         try:
             cached = self.cache.cached_detail(account_name, uid)
         except RuntimeError as exc:
             raise ViewerError(str(exc)) from exc
-        if cached is not None:
+        cached_web_body_is_current = bool(
+            cached is not None
+            and cached.html_policy == HTML_POLICY_VERSION
+            and (
+                cached.body_format == "plain"
+                or (
+                    cached.body_format == "html"
+                    and cached.safe_html
+                )
+            )
+        )
+        if cached is not None and (not prefer_html or cached_web_body_is_current):
+            cached_has_html = bool(
+                cached_web_body_is_current
+                and cached.body_format == "html"
+                and cached.safe_html
+            )
             return MailDetail(
                 uid=cached.message.uid,
                 subject=cached.message.subject,
@@ -1168,19 +1301,71 @@ class ViewerRuntime:
                 date=cached.message.date,
                 text=cached.text,
                 attachments=cached.attachments,
+                safe_html=cached.safe_html if cached_has_html else "",
+                body_format=cached.body_format,
+                blocked_images=(
+                    cached.blocked_images if cached_web_body_is_current else 0
+                ),
+                html_policy=(
+                    cached.html_policy if cached_web_body_is_current else ""
+                ),
             )
+        fetched: MailDetail | None = None
         try:
-            return self.sync.fetch_detail(account_name, uid)
+            fetched = self.sync.fetch_detail(
+                account_name, uid, prefer_html=prefer_html
+            )
         except ViewerError:
-            raise
+            if cached is None:
+                raise
         except TimeoutError as exc:
-            raise ViewerError(str(exc)) from exc
+            if cached is None:
+                raise ViewerError(str(exc)) from exc
         except Exception as exc:
-            raise ViewerError(str(exc)) from exc
+            if cached is None:
+                raise ViewerError(str(exc)) from exc
+        if fetched is not None and (
+            cached is None or bool(getattr(fetched, "cacheable", True))
+        ):
+            return fetched
+        if fetched is not None and cached is not None:
+            try:
+                cached = self.cache.cached_detail(account_name, uid) or cached
+            except RuntimeError:
+                pass
+        fetched_attachments = tuple(
+            getattr(fetched, "attachments", ()) if fetched is not None else ()
+        )
+        fetched_recipients = str(
+            getattr(fetched, "recipients", "") if fetched is not None else ""
+        )
+        return MailDetail(
+            uid=cached.message.uid,
+            subject=cached.message.subject,
+            sender=cached.message.sender,
+            recipients=fetched_recipients or cached.message.recipients,
+            date=cached.message.date,
+            text=cached.text,
+            attachments=fetched_attachments or cached.attachments,
+            body_format="plain",
+        )
 
 
 def _mail_summary(item: CachedMessage) -> MailSummary:
     return MailSummary(item.uid, item.subject, item.sender, item.date, item.size)
+
+
+def _mail_detail_record(item: MailDetail) -> dict[str, object]:
+    """Keep the public CLI JSON shape independent from web-only body fields."""
+    return {
+        "uid": item.uid,
+        "subject": item.subject,
+        "sender": item.sender,
+        "recipients": item.recipients,
+        "date": item.date,
+        "text": item.text,
+        "attachments": item.attachments,
+    }
 
 
 def cached_page(
@@ -1200,7 +1385,9 @@ def cached_page(
     )
     account_map = {account.name: account for account in runtime.accounts}
     owned = tuple(
-        AccountMailSummary(account_map[item.account_name], _mail_summary(item))
+        AccountMailSummary(
+            account_map[item.account_name], _mail_summary(item), item.unread
+        )
         for item in cached.messages
         if item.account_name in account_map
     )
@@ -1296,14 +1483,37 @@ def aggregate_cli(
     return {"messages": records, "errors": errors}
 
 
+MAIL_BODY_CSP = (
+    "default-src 'none'; script-src 'none'; connect-src 'none'; "
+    "img-src 'none'; font-src 'none'; media-src 'none'; object-src 'none'; "
+    "frame-src 'none'; style-src 'unsafe-inline'; base-uri 'none'; "
+    "form-action 'none'"
+)
+
+MAIL_BODY_STYLE = """
+:root{color-scheme:light}*{box-sizing:border-box}html{min-width:0;background:#fff}body{min-width:0;margin:0;padding:28px;background:#fff;color:#242424;font:15px/1.65 -apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;overflow:auto;overflow-wrap:anywhere}table{max-width:none}td,th{overflow-wrap:break-word}pre{white-space:pre-wrap;overflow-wrap:anywhere}a{color:#282828;font-weight:650;text-decoration:underline;text-underline-offset:2px;overflow-wrap:anywhere}.mail-image-placeholder{display:inline-flex;align-items:center;justify-content:center;min-width:120px;min-height:52px;max-width:100%;margin:4px 0;padding:10px 14px;border:1px dashed #b8b8b8;border-radius:8px;background:#f5f5f5;color:#6b6b6b;font:13px/1.45 -apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;text-align:center;vertical-align:middle}@media(max-width:600px){body{padding:18px 16px;font-size:16px}}
+""".strip()
+
+
+def _mail_body_srcdoc(safe_html: str) -> str:
+    document = (
+        '<!doctype html><html lang="zh-CN"><head><meta charset="utf-8">'
+        '<meta name="viewport" content="width=device-width,initial-scale=1">'
+        f'<meta http-equiv="Content-Security-Policy" content="{html.escape(MAIL_BODY_CSP, quote=True)}">'
+        f"<style>{MAIL_BODY_STYLE}</style></head><body>{safe_html}</body></html>"
+    )
+    return html.escape(document, quote=True)
+
+
 BASE_STYLE = """
 :root{color-scheme:light dark;--canvas:#fff;--surface:#fff;--surface-raised:#f5f5f5;--ink:#242424;--muted:#6b6b6b;--quiet:#969696;--line:#e6e6e6;--line-strong:#d4d4d4;--accent:#282828;--accent-ink:#fff;--accent-wash:#ededed;--danger:#9b2d30;--danger-wash:#fff2f2;--shadow:0 18px 42px rgba(0,0,0,.06)}
 @media(prefers-color-scheme:dark){:root{--canvas:#191919;--surface:#202020;--surface-raised:#292929;--ink:#f2f2f2;--muted:#b5b5b5;--quiet:#858585;--line:#343434;--line-strong:#4a4a4a;--accent:#d9d9d9;--accent-ink:#1b1b1b;--accent-wash:#303030;--danger:#ffb6b6;--danger-wash:#392126;--shadow:0 18px 42px rgba(0,0,0,.24)}}
-*{box-sizing:border-box}body{margin:0;background:var(--canvas);color:var(--ink);font:15px/1.55 -apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif}button,input,select{font:inherit}a{color:inherit}main{max-width:1160px;margin:0 auto;padding:48px 26px 76px}h1,h2,p{margin:0}.app-header{display:flex;align-items:flex-end;justify-content:space-between;gap:28px;padding-bottom:26px;border-bottom:1px solid var(--line)}h1{font-size:clamp(26px,4vw,34px);line-height:1.12;letter-spacing:-.025em}.account{margin-top:8px;color:var(--muted);overflow-wrap:anywhere}.mailbox-state{display:flex;flex-wrap:wrap;gap:8px;margin-top:16px}.state-chip{padding:4px 9px;border-radius:999px;background:var(--accent-wash);color:var(--accent);font-size:13px;font-weight:700}.state-text{padding:4px 0;color:var(--muted);font-size:13px}.control-bar{display:flex;align-items:center;justify-content:space-between;gap:16px;padding:18px 0}.filter-group,.pagination,.jump-form,.account-switcher,.page-size-switcher{display:flex;align-items:center;gap:8px;flex-wrap:wrap}.segmented{display:flex;padding:3px;border:1px solid var(--line);border-radius:11px;background:var(--surface-raised)}.account-tabs,.page-size-tabs{flex-wrap:wrap}.segment{padding:7px 11px;border-radius:8px;text-decoration:none;color:var(--muted);font-size:14px;font-weight:650}.segment[aria-current="page"]{background:var(--surface);box-shadow:0 2px 7px rgba(30,44,67,.12);color:var(--ink)}.field-label{color:var(--muted);font-size:13px;font-weight:650}.select,.page-input{height:35px;border:1px solid var(--line-strong);border-radius:8px;background:var(--surface);color:var(--ink);padding:0 9px}.page-input{width:52px;text-align:center}.button,.page-link{min-height:35px;display:inline-flex;align-items:center;justify-content:center;padding:0 11px;border:1px solid var(--line-strong);border-radius:8px;background:var(--surface);color:var(--ink);text-decoration:none;cursor:pointer;font-weight:650;font-size:14px}.button.primary{background:var(--accent);border-color:var(--accent);color:var(--accent-ink)}.button:hover,.page-link:hover{border-color:var(--accent);color:var(--accent)}.button.primary:hover{filter:brightness(1.06);color:var(--accent-ink)}.page-link.disabled{border-color:var(--line);background:var(--surface-raised);color:var(--quiet);cursor:default}.pagination{justify-content:space-between;padding:15px 0}.page-controls{display:flex;align-items:center;gap:7px;flex-wrap:wrap}.page-status{color:var(--muted);font-size:14px;font-weight:650}.mailbox{border-top:1px solid var(--line);border-bottom:1px solid var(--line);background:var(--surface);box-shadow:var(--shadow)}.list-head,.mail{display:grid;grid-template-columns:minmax(220px,1.12fr) minmax(280px,1.85fr) 148px;gap:24px;align-items:center}.list-head{padding:10px 20px;background:var(--surface-raised);border-bottom:1px solid var(--line);color:var(--muted);font-size:12px;font-weight:750;letter-spacing:.04em}.mail{min-height:72px;padding:13px 20px;border-bottom:1px solid var(--line);text-decoration:none;position:relative;transition:background .16s ease,box-shadow .16s ease}.mail:last-child{border-bottom:0}.mail:hover{background:color-mix(in srgb,var(--accent) 6%,var(--surface))}.mail:focus-visible{outline:3px solid color-mix(in srgb,var(--accent) 55%,transparent);outline-offset:-3px;z-index:1}.sender-name{display:block;color:var(--ink);font-weight:650;overflow-wrap:anywhere}.sender-address,.account-tag{display:block;margin-top:2px;color:var(--muted);font-size:13px;overflow-wrap:anywhere}.account-tag{font-size:12px}.subject{font-weight:700;overflow-wrap:anywhere;line-height:1.4}.date{color:var(--muted);font-variant-numeric:tabular-nums;white-space:nowrap;text-align:right}.empty-state,.error-state{padding:64px 24px;text-align:center;background:var(--surface)}.empty-state h2,.error-state h2{font-size:20px}.empty-state p,.error-state p{max-width:48ch;margin:8px auto 0;color:var(--muted)}.notice{margin:0 0 14px;padding:10px 13px;border:1px solid var(--line-strong);background:var(--surface-raised);color:var(--muted);font-size:14px}.notice.warning{border-color:var(--line-strong)}.detail-header{display:flex;align-items:flex-start;justify-content:space-between;gap:24px;padding-bottom:22px;border-bottom:1px solid var(--line)}.detail-subject{max-width:800px;font-size:clamp(24px,3.6vw,32px);overflow-wrap:anywhere}.read-only-note{margin-top:8px;color:var(--muted)}.message-shell{max-width:930px;margin-top:28px;background:var(--surface);box-shadow:var(--shadow)}.message-meta{display:grid;grid-template-columns:90px minmax(0,1fr);gap:10px 22px;padding:24px;border-bottom:1px solid var(--line)}.message-meta dt{color:var(--muted);font-weight:650}.message-meta dd{margin:0;overflow-wrap:anywhere}.attachments{margin:20px 24px 0;padding:13px 15px;border:1px solid var(--line);background:var(--surface-raised)}.attachment-label{font-weight:750}.body{padding:28px 24px 34px;white-space:pre-wrap;overflow-wrap:anywhere;font:15px/1.78 ui-monospace,SFMono-Regular,Menlo,monospace}.error-state{max-width:700px;margin:72px auto;box-shadow:var(--shadow)}.error-state h2{color:var(--danger)}.error-state .button{margin-top:20px}
+*{box-sizing:border-box}body{margin:0;background:var(--canvas);color:var(--ink);font:15px/1.55 -apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif}button,input,select{font:inherit}a{color:inherit}main{max-width:1160px;margin:0 auto;padding:48px 26px 76px}h1,h2,p{margin:0}.app-header{display:flex;align-items:flex-end;justify-content:space-between;gap:28px;padding-bottom:26px;border-bottom:1px solid var(--line)}.header-copy{flex:1;min-width:0}h1{font-size:clamp(26px,4vw,34px);line-height:1.12;letter-spacing:-.025em}.account{margin-top:8px;color:var(--muted);overflow-wrap:anywhere}.account-summary{display:flex;align-items:baseline;flex-wrap:wrap;gap:4px 7px;min-height:22px;margin-top:9px}.account-summary-name{color:var(--ink);font-size:15px;font-weight:700;white-space:nowrap}.account-summary-count,.account-summary-detail{min-width:0;color:var(--muted);font-size:13px;overflow-wrap:anywhere}.account-summary-separator{color:var(--quiet);font-size:12px}.mailbox-state{display:flex;align-items:center;flex-wrap:wrap;gap:8px;margin-top:16px}.state-chip{flex:0 0 auto;padding:4px 9px;border-radius:999px;background:var(--accent-wash);color:var(--accent);font-size:13px;font-weight:700}.state-text{display:grid;grid-template-columns:72px 132px 96px max-content;align-items:center;color:var(--muted);font-size:13px;font-variant-numeric:tabular-nums}.state-stat{position:relative;white-space:nowrap}.state-stat:not(:last-child)::after{content:"·";position:absolute;right:7px;color:var(--quiet)}.state-text-empty{grid-template-columns:188px max-content}.control-bar{display:flex;align-items:center;justify-content:space-between;gap:16px;padding:18px 0}.filter-group,.pagination,.jump-form,.account-switcher,.page-size-switcher{display:flex;align-items:center;gap:8px;flex-wrap:wrap}.segmented{display:flex;padding:3px;border:1px solid var(--line);border-radius:11px;background:var(--surface-raised)}.account-tabs,.page-size-tabs{flex-wrap:wrap}.segment{padding:7px 11px;border-radius:8px;text-decoration:none;color:var(--muted);font-size:14px;font-weight:650}.segment[aria-current="page"],.segment[aria-pressed="true"]{background:var(--surface);box-shadow:0 2px 7px rgba(30,44,67,.12);color:var(--ink)}.field-label{color:var(--muted);font-size:13px;font-weight:650}.select,.page-input{height:35px;border:1px solid var(--line-strong);border-radius:8px;background:var(--surface);color:var(--ink);padding:0 9px}.page-input{width:52px;text-align:center}.button,.page-link{min-height:35px;display:inline-flex;align-items:center;justify-content:center;padding:0 11px;border:1px solid var(--line-strong);border-radius:8px;background:var(--surface);color:var(--ink);text-decoration:none;cursor:pointer;font-weight:650;font-size:14px}.button.primary{background:var(--accent);border-color:var(--accent);color:var(--accent-ink)}.button:hover,.page-link:hover{border-color:var(--accent);color:var(--accent)}.button.primary:hover{filter:brightness(1.06);color:var(--accent-ink)}.page-link.disabled{border-color:var(--line);background:var(--surface-raised);color:var(--quiet);cursor:default}.pagination{justify-content:space-between;padding:15px 0}.page-controls{display:flex;align-items:center;gap:7px;flex-wrap:wrap}.page-status{color:var(--muted);font-size:14px;font-weight:650}.mailbox{border-top:1px solid var(--line);border-bottom:1px solid var(--line);background:var(--surface);box-shadow:var(--shadow)}.list-head,.mail{display:grid;grid-template-columns:minmax(220px,1.12fr) minmax(280px,1.85fr) 148px;gap:24px;align-items:center}.list-head{padding:10px 20px;background:var(--surface-raised);border-bottom:1px solid var(--line);color:var(--muted);font-size:12px;font-weight:750;letter-spacing:.04em}.mail{min-height:72px;padding:13px 20px;border-bottom:1px solid var(--line);text-decoration:none;position:relative;transition:background .16s ease,box-shadow .16s ease}.mail:last-child{border-bottom:0}.mail:hover{background:color-mix(in srgb,var(--accent) 6%,var(--surface))}.mail:focus-visible{outline:3px solid color-mix(in srgb,var(--accent) 55%,transparent);outline-offset:-3px;z-index:1}.sender{display:grid;gap:3px}.mail-address-row{display:grid;grid-template-columns:52px minmax(0,1fr);gap:8px;align-items:baseline;min-width:0}.mail-address-label{color:var(--quiet);font-size:11px;font-weight:750;line-height:1.4;white-space:nowrap}.recipient-account{margin-top:3px}.recipient-account .mail-address-label{color:var(--muted)}.sender-name{display:block;color:var(--ink);font-weight:650;overflow-wrap:anywhere}.sender-address,.account-tag{display:block;color:var(--muted);font-size:13px;overflow-wrap:anywhere}.sender-address-primary{color:var(--ink);font-size:15px;font-weight:650}.account-tag{font-size:12px}.subject{font-weight:700;overflow-wrap:anywhere;line-height:1.4}.date{color:var(--muted);font-variant-numeric:tabular-nums;white-space:nowrap;text-align:right}.empty-state,.error-state{padding:64px 24px;text-align:center;background:var(--surface)}.empty-state h2,.error-state h2{font-size:20px}.empty-state p,.error-state p{max-width:48ch;margin:8px auto 0;color:var(--muted)}.notice{margin:0 0 14px;padding:10px 13px;border:1px solid var(--line-strong);background:var(--surface-raised);color:var(--muted);font-size:14px}.notice.warning{border-color:var(--line-strong)}.detail-header{display:flex;align-items:flex-start;justify-content:space-between;gap:24px;padding-bottom:22px;border-bottom:1px solid var(--line)}.detail-subject{max-width:800px;font-size:clamp(24px,3.6vw,32px);overflow-wrap:anywhere}.read-only-note{margin-top:8px;color:var(--muted)}.message-shell{width:100%;max-width:930px;margin-top:28px;background:var(--surface);box-shadow:var(--shadow)}.message-meta{display:grid;grid-template-columns:90px minmax(0,1fr);gap:10px 22px;padding:24px;border-bottom:1px solid var(--line)}.message-meta dt{color:var(--muted);font-weight:650}.message-meta dd{margin:0;overflow-wrap:anywhere}.attachments{margin:20px 24px 0;padding:13px 15px;border:1px solid var(--line);background:var(--surface-raised)}.attachment-label{font-weight:750}.message-body-toolbar{display:flex;align-items:center;justify-content:space-between;gap:16px;padding:18px 24px 12px}.body-view-controls{display:flex;align-items:center;gap:8px;flex-wrap:wrap}.body-view-tabs{display:inline-flex}.body-mode-button{border:0;background:transparent;cursor:pointer}.body-image-notice{color:var(--muted);font-size:13px}.body-panel{min-width:0;border-top:1px solid var(--line)}.body-panel[hidden]{display:none}.message-body-frame{display:block;width:100%;height:320px;min-height:320px;border:0;background:#fff}.body{max-width:76ch;min-height:260px;margin:0;padding:28px 24px 34px;white-space:pre-wrap;overflow-wrap:anywhere;font:15px/1.75 -apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;unicode-bidi:plaintext}.external-link-dialog{width:min(560px,calc(100vw - 32px));padding:0;border:1px solid var(--line-strong);border-radius:14px;background:var(--surface);color:var(--ink);box-shadow:0 24px 64px rgba(0,0,0,.24)}.external-link-dialog::backdrop{background:rgba(0,0,0,.46)}.external-link-content{padding:24px}.external-link-content h2{font-size:20px}.external-link-content p{margin-top:8px;color:var(--muted)}.external-link-url{display:block;max-height:150px;margin-top:16px;padding:11px 12px;overflow:auto;border:1px solid var(--line);background:var(--surface-raised);font:13px/1.55 ui-monospace,SFMono-Regular,Menlo,monospace;overflow-wrap:anywhere;white-space:pre-wrap}.external-link-actions{display:flex;justify-content:flex-end;gap:8px;margin-top:20px}.external-link-actions form{margin:0}.error-state{max-width:700px;margin:72px auto;box-shadow:var(--shadow)}.error-state h2{color:var(--danger)}.error-state .button{margin-top:20px}
 .segmented{position:relative;isolation:isolate}.segment{position:relative;z-index:1;transition:color .16s ease}.segmented.is-sliding .segment[aria-current="page"]{background:transparent;box-shadow:none}.segment-slider{position:absolute;z-index:0;border-radius:8px;background:var(--surface);pointer-events:none;will-change:transform}.segment.is-transition-source{color:var(--muted)}.segment.is-transition-target{color:var(--ink)}
+.sender,.subject{min-width:0}.subject-text{display:block;min-width:0;overflow-wrap:anywhere}.mailbox-with-status .list-head,.mailbox-with-status .mail{grid-template-columns:minmax(0,1.12fr) minmax(0,1.85fr) 52px 148px}.status-head{text-align:center}.message-status{justify-self:center;min-width:44px;padding:2px 6px;border:1px solid var(--line-strong);border-radius:8px;background:var(--surface-raised);color:var(--muted);font-size:13px;font-weight:750;line-height:1.2;text-align:center;white-space:nowrap}.mail-unread{background:color-mix(in srgb,var(--accent) 4%,var(--surface))}.mail-unread .sender-name,.mail-unread .subject-text{font-weight:750}.mail-unread .message-status{border-color:var(--accent);background:var(--accent);color:var(--accent-ink)}.mail-read .sender-name,.mail-read .subject-text{color:var(--muted);font-weight:500}
 @media(prefers-reduced-motion:reduce){.segment{transition:none}}
-@media(max-width:780px){main{padding:28px 16px 52px}.app-header,.detail-header{display:block}.control-bar{align-items:flex-start;flex-direction:column}.pagination{align-items:flex-start;flex-direction:column}.list-head{display:none}.mail{grid-template-columns:minmax(0,1fr);gap:5px;padding:15px 16px}.subject{grid-column:1;grid-row:1}.mail .sender{grid-column:1;grid-row:2}.date{grid-column:1;grid-row:3;margin-top:2px;text-align:left;white-space:normal;font-size:13px}.sender-name{font-size:14px}.sender-address{max-width:100%;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}.message-shell{margin-top:22px}.message-meta{grid-template-columns:1fr;gap:2px;padding:20px}.message-meta dt:not(:first-child){margin-top:12px}.body{padding:24px 20px}.jump-form{width:100%}.page-input{width:64px}}
-.header-actions{display:flex;align-items:center;gap:8px;flex-wrap:wrap}.number-input{width:110px;height:35px;border:1px solid var(--line-strong);border-radius:8px;background:var(--surface);color:var(--ink);padding:0 9px}.button.danger{border-color:var(--danger);color:var(--danger)}.button:focus-visible,.page-link:focus-visible,.select:focus-visible,.page-input:focus-visible,.number-input:focus-visible,.segment:focus-visible{outline:3px solid color-mix(in srgb,var(--accent) 55%,transparent);outline-offset:2px}.settings-header{display:flex;justify-content:space-between;align-items:flex-start;gap:24px;padding-bottom:24px;border-bottom:1px solid var(--line)}.settings-shell{max-width:760px;margin-top:28px;display:grid;gap:18px}.settings-card{padding:24px;background:var(--surface);border:1px solid var(--line);box-shadow:var(--shadow)}.settings-card h2{font-size:20px}.settings-card p{margin-top:7px;color:var(--muted)}.settings-form{display:grid;gap:18px;margin-top:20px}.form-row{display:grid;grid-template-columns:180px minmax(0,1fr);gap:16px;align-items:center}.form-help{display:block;margin-top:5px;color:var(--muted);font-size:13px}.settings-actions{display:flex;gap:8px;flex-wrap:wrap;padding-top:4px}.danger-zone{border-color:color-mix(in srgb,var(--danger) 35%,var(--line))}.inline-form{display:inline-flex;margin:14px 8px 0 0}@media(max-width:780px){.settings-header{display:block}.header-actions{margin-top:18px}.form-row{grid-template-columns:1fr;gap:6px}.settings-card{padding:20px}}
+@media(max-width:780px){main{padding:28px 16px 52px}.app-header,.detail-header{display:block}.account-summary{gap:3px 6px}.mailbox-state{display:block}.state-text{grid-template-columns:112px minmax(0,1fr);gap:4px 12px;margin-top:8px}.state-stat::after{display:none}.state-text-empty{grid-template-columns:1fr}.control-bar{align-items:flex-start;flex-direction:column}.pagination{align-items:flex-start;flex-direction:column}.list-head{display:none}.mail{grid-template-columns:minmax(0,1fr);gap:5px;padding:15px 16px}.subject{grid-column:1;grid-row:1}.mail .sender{grid-column:1;grid-row:2}.date{grid-column:1;grid-row:3;margin-top:2px;text-align:left;white-space:normal;font-size:13px}.mailbox-with-status .mail{grid-template-columns:52px minmax(0,1fr)}.mailbox-with-status .subject,.mailbox-with-status .mail .sender{grid-column:1 / -1}.mailbox-with-status .message-status{grid-column:1;grid-row:3;justify-self:start}.mailbox-with-status .date{grid-column:2;grid-row:3;justify-self:end;margin-top:0;text-align:right}.sender-name{font-size:14px}.sender-address{max-width:100%;white-space:normal;overflow-wrap:anywhere}.message-shell{margin-top:22px}.message-meta{grid-template-columns:1fr;gap:2px;padding:20px}.message-meta dt:not(:first-child){margin-top:12px}.message-body-toolbar{align-items:flex-start;flex-direction:column;padding:16px 20px 10px}.message-body-frame{height:520px}.body{padding:24px 20px}.jump-form{width:100%}.page-input{width:64px}}
+.header-actions{display:flex;align-items:center;gap:8px;flex-wrap:wrap}.number-input{width:110px;height:35px;border:1px solid var(--line-strong);border-radius:8px;background:var(--surface);color:var(--ink);padding:0 9px}.button.danger{border-color:var(--danger);color:var(--danger)}.button:focus-visible,.page-link:focus-visible,.select:focus-visible,.page-input:focus-visible,.number-input:focus-visible,.segment:focus-visible,.body-mode-button:focus-visible{outline:3px solid color-mix(in srgb,var(--accent) 55%,transparent);outline-offset:2px}.settings-header{display:flex;justify-content:space-between;align-items:flex-start;gap:24px;padding-bottom:24px;border-bottom:1px solid var(--line)}.settings-shell{max-width:760px;margin-top:28px;display:grid;gap:18px}.settings-card{padding:24px;background:var(--surface);border:1px solid var(--line);box-shadow:var(--shadow)}.settings-card h2{font-size:20px}.settings-card p{margin-top:7px;color:var(--muted)}.settings-form{display:grid;gap:18px;margin-top:20px}.form-row{display:grid;grid-template-columns:180px minmax(0,1fr);gap:16px;align-items:center}.form-help{display:block;margin-top:5px;color:var(--muted);font-size:13px}.settings-actions{display:flex;gap:8px;flex-wrap:wrap;padding-top:4px}.danger-zone{border-color:color-mix(in srgb,var(--danger) 35%,var(--line))}.inline-form{display:inline-flex;margin:14px 8px 0 0}@media(max-width:780px){.settings-header{display:block}.header-actions{margin-top:18px}.form-row{grid-template-columns:1fr;gap:6px}.settings-card{padding:20px}}
 """
 
 
@@ -1311,6 +1521,7 @@ BASE_SCRIPT = """
 (() => {
   const reducedMotion = window.matchMedia("(prefers-reduced-motion: reduce)");
   let navigating = false;
+  const wiredFrameDocuments = new WeakSet();
 
   const fetchPage = async (url) => {
     const response = await window.fetch(url, {
@@ -1337,6 +1548,7 @@ BASE_SCRIPT = """
     if (!currentMain) throw new Error("当前页面缺少主内容。");
     currentMain.replaceWith(nextPage.main);
     document.title = nextPage.title;
+    initializeMessageBodies();
     if (pushHistory) {
       window.history.pushState({mailViewer: true}, "", nextPage.url);
     }
@@ -1393,6 +1605,127 @@ BASE_SCRIPT = """
       animation.finished.catch(() => undefined),
       new Promise((resolve) => window.setTimeout(resolve, 320)),
     ]);
+  };
+
+  const resizeMessageFrame = (frame) => {
+    try {
+      const frameDocument = frame.contentDocument;
+      if (!frameDocument) return;
+      frame.style.height = "320px";
+      const height = Math.max(
+        frameDocument.body?.scrollHeight || 0,
+        frameDocument.documentElement?.scrollHeight || 0,
+      );
+      frame.style.height = `${Math.min(1200, Math.max(320, Math.ceil(height)))}px`;
+    } catch (_error) {
+      frame.style.height = "560px";
+    }
+  };
+
+  const confirmExternalLink = (shell, url) => {
+    const dialog = shell.querySelector("[data-external-link-dialog]");
+    const output = dialog?.querySelector("[data-external-link-url]");
+    if (
+      typeof HTMLDialogElement === "undefined" ||
+      !(dialog instanceof HTMLDialogElement) ||
+      !output
+    ) {
+      if (window.confirm(`即将打开外部网页：\n${url.href}\n\n是否继续？`)) {
+        const opened = window.open(url.href, "_blank", "noopener,noreferrer");
+        if (opened) opened.opener = null;
+      }
+      return;
+    }
+    output.textContent = url.href;
+    dialog.dataset.externalUrl = url.href;
+    dialog.showModal();
+  };
+
+  const initializeMessageBodies = () => {
+    document.querySelectorAll("[data-message-body]").forEach((shell) => {
+      if (!(shell instanceof HTMLElement) || shell.dataset.initialized === "true") return;
+      shell.dataset.initialized = "true";
+
+      const buttons = Array.from(shell.querySelectorAll("[data-body-mode]"));
+      const panels = Array.from(shell.querySelectorAll("[data-body-panel]"));
+      buttons.forEach((button) => {
+        button.addEventListener("click", () => {
+          const mode = button.getAttribute("data-body-mode");
+          buttons.forEach((item) => {
+            item.setAttribute(
+              "aria-pressed",
+              item.getAttribute("data-body-mode") === mode ? "true" : "false",
+            );
+          });
+          panels.forEach((panel) => {
+            panel.hidden = panel.getAttribute("data-body-panel") !== mode;
+          });
+          const frame = shell.querySelector(".message-body-frame:not([hidden])");
+          if (frame instanceof HTMLIFrameElement) resizeMessageFrame(frame);
+        });
+      });
+
+      const frame = shell.querySelector(".message-body-frame");
+      if (frame instanceof HTMLIFrameElement) {
+        const wireFrame = () => {
+          resizeMessageFrame(frame);
+          try {
+            const frameDocument = frame.contentDocument;
+            if (!frameDocument || wiredFrameDocuments.has(frameDocument)) return;
+            wiredFrameDocuments.add(frameDocument);
+            frameDocument.addEventListener("click", (event) => {
+              const eventTarget = event.target;
+              if (!eventTarget || eventTarget.nodeType !== 1) return;
+              const anchor = eventTarget.closest?.("a[href]");
+              if (!anchor) return;
+              event.preventDefault();
+              if (event.button !== 0) return;
+              const href = anchor.getAttribute("href");
+              if (!href) return;
+              let destination;
+              try {
+                destination = new URL(href);
+              } catch (_error) {
+                return;
+              }
+              if (!['http:', 'https:'].includes(destination.protocol)) return;
+              confirmExternalLink(shell, destination);
+            });
+          } catch (_error) {
+            return;
+          }
+        };
+        frame.addEventListener("load", wireFrame);
+        if (frame.contentDocument?.readyState === "complete") {
+          window.setTimeout(wireFrame, 0);
+        }
+      }
+
+      const dialog = shell.querySelector("[data-external-link-dialog]");
+      const openButton = dialog?.querySelector("[data-open-external-link]");
+      if (
+        typeof HTMLDialogElement !== "undefined" &&
+        dialog instanceof HTMLDialogElement &&
+        openButton instanceof HTMLButtonElement
+      ) {
+        openButton.addEventListener("click", () => {
+          let destination;
+          try {
+            destination = new URL(dialog.dataset.externalUrl || "");
+          } catch (_error) {
+            dialog.close();
+            return;
+          }
+          if (!['http:', 'https:'].includes(destination.protocol)) {
+            dialog.close();
+            return;
+          }
+          const opened = window.open(destination.href, "_blank", "noopener,noreferrer");
+          if (opened) opened.opener = null;
+          dialog.close();
+        });
+      }
+    });
   };
 
   document.addEventListener("click", async (event) => {
@@ -1453,6 +1786,12 @@ BASE_SCRIPT = """
       navigating = false;
     }
   });
+  window.addEventListener("resize", () => {
+    document.querySelectorAll(".message-body-frame").forEach((frame) => {
+      if (frame instanceof HTMLIFrameElement) resizeMessageFrame(frame);
+    });
+  });
+  initializeMessageBodies();
 })();
 """
 
@@ -1650,15 +1989,38 @@ class ViewerHandler(BaseHTTPRequestHandler):
         params = parse_listing_params(query)
         runtime = self._runtime()
         accounts = runtime.accounts
+        provider_counts = {
+            provider: sum(account.provider == provider for account in accounts)
+            for provider in {account.provider for account in accounts}
+        }
+        account_labels: dict[str, str] = {}
+        for account in accounts:
+            provider_label = PROVIDER_TAB_LABELS.get(account.provider, account.name)
+            if account.provider == "custom":
+                account_labels[account.name] = account.name
+            elif provider_counts[account.provider] > 1:
+                account_labels[account.name] = f"{provider_label} · {account.name}"
+            else:
+                account_labels[account.name] = provider_label
         requested = query.get("account", [None])[0]
         selection = requested or ("all" if len(accounts) >= 2 else default_account(accounts).name)
         if selection == "all":
             selected_names = tuple(account.name for account in accounts)
-            address = "全部账户 · " + "、".join(account.email for account in accounts)
+            scope_summary = (
+                f'<p class="account-summary" aria-label="已添加邮箱，共 {len(accounts)} 个">'
+                '<strong class="account-summary-name">已添加邮箱</strong>'
+                f'<span class="account-summary-count">（{len(accounts)} 个）</span></p>'
+            )
         else:
             selected_account = find_account(selection, accounts)
             selected_names = (selected_account.name,)
-            address = f"{selected_account.email} · {selected_account.provider_label}"
+            scope_name = account_labels[selected_account.name]
+            scope_summary = (
+                '<p class="account-summary">'
+                f'<strong class="account-summary-name" title="{html.escape(scope_name, quote=True)}">{html.escape(scope_name)}</strong>'
+                '<span class="account-summary-separator" aria-hidden="true">·</span>'
+                f'<span class="account-summary-detail" title="{html.escape(selected_account.email, quote=True)}">{html.escape(selected_account.email)}</span></p>'
+            )
         errors = self._prepare_cache(
             runtime,
             selected_names,
@@ -1673,30 +2035,59 @@ class ViewerHandler(BaseHTTPRequestHandler):
             limit=params.limit,
             offset=params.offset,
         )
-        if selection == "all":
-            items = tuple((entry.message, entry.account) for entry in aggregate_items)
-        else:
-            items = tuple((item, selected_account) for item in page_data.messages)
+        items = tuple(
+            (entry.message, entry.account, entry.unread is True)
+            for entry in aggregate_items
+        )
         rows = []
-        for item, item_account in items:
+        for item, item_account, is_unread in items:
             sender_name, sender_address = sender_parts(item.sender)
+            sender_name_row = (
+                f'<span class="sender-name">{html.escape(sender_name)}</span>'
+                if sender_name
+                else ""
+            )
+            sender_address_class = (
+                "sender-address"
+                if sender_name
+                else "sender-address sender-address-primary"
+            )
+            sender_address_row = (
+                f'<span class="mail-address-row sender-email"><span class="mail-address-label">发件邮箱</span><span class="{sender_address_class}">{html.escape(sender_address)}</span></span>'
+                if sender_address
+                else ""
+            )
             account_tag = (
-                f'<span class="account-tag">{html.escape(item_account.name)} · {html.escape(item_account.email)}</span>'
+                f'<span class="mail-address-row recipient-account"><span class="mail-address-label">收件账户</span><span class="account-tag">{html.escape(item_account.name)} · {html.escape(item_account.email)}</span></span>'
                 if selection == "all"
                 else ""
             )
+            state_class = ""
+            state_badge = ""
+            if not params.unread_only:
+                state_class = " mail-unread" if is_unread else " mail-read"
+                state_label = "未读" if is_unread else "已读"
+                state_badge = f'<span class="message-status">{state_label}</span>'
             rows.append(
-                f'''<a class="mail" href="{html.escape(self._message_url(item, params, page_data.offset, item_account.name, selection), quote=True)}">
-  <span class="sender"><span class="sender-name">{html.escape(sender_name)}</span>{f'<span class="sender-address">{html.escape(sender_address)}</span>' if sender_address else ''}{account_tag}</span>
-  <span class="subject">{html.escape(item.subject)}</span><time class="date">{html.escape(item.date)}</time>
+                f'''<a class="mail{state_class}" href="{html.escape(self._message_url(item, params, page_data.offset, item_account.name, selection), quote=True)}">
+  <span class="sender">{sender_name_row}{sender_address_row}{account_tag}</span>
+  <span class="subject"><span class="subject-text">{html.escape(item.subject)}</span></span>{state_badge}<time class="date">{html.escape(item.date)}</time>
 </a>'''
-            )
+        )
         if page_data.total:
-            range_text = f"显示第 {page_data.offset + 1}–{page_data.offset + len(page_data.messages)} 封"
-            page_text = f"第 {page_data.current_page} / {page_data.page_count} 页"
+            state_text_class = "state-text"
+            state_text = (
+                f'<span class="state-stat state-total">共 {page_data.total} 封</span>'
+                f'<span class="state-stat state-range">显示第 {page_data.offset + 1}–{page_data.offset + len(page_data.messages)} 封</span>'
+                f'<span class="state-stat state-page">第 {page_data.current_page} / {page_data.page_count} 页</span>'
+                '<span class="state-stat state-sort">按日期倒序</span>'
+            )
         else:
-            range_text = "没有符合当前筛选的邮件"
-            page_text = "没有可分页的邮件"
+            state_text_class = "state-text state-text-empty"
+            state_text = (
+                '<span class="state-stat state-empty">没有符合当前筛选的邮件</span>'
+                '<span class="state-stat state-sort">按日期倒序</span>'
+            )
         notice = ""
         if params.invalid_page:
             notice = '<p class="notice" role="status">页码必须是大于 0 的整数，已显示可用页面。</p>'
@@ -1715,17 +2106,19 @@ class ViewerHandler(BaseHTTPRequestHandler):
         unread_url = listing_url(True, params.limit, 0, selection)
         all_url = listing_url(False, params.limit, 0, selection)
         selected_mode = "未读邮件" if params.unread_only else "全部邮件"
+        mailbox_class = "mailbox" if params.unread_only else "mailbox mailbox-with-status"
+        status_heading = "" if params.unread_only else '<span class="status-head">状态</span>'
         listing = "".join(rows) if rows else '<div class="empty-state"><h2>这里没有符合条件的邮件</h2><p>你可以切换到全部邮件，或稍后刷新再试。</p></div>'
         account_link_parts: list[str] = []
         for account in accounts:
             current_attribute = ' aria-current="page"' if selection == account.name else ""
             account_link_parts.append(
-                f'<a class="segment" href="{html.escape(listing_url(params.unread_only, params.limit, 0, account.name), quote=True)}" aria-label="{html.escape(account.name + "，" + account.email, quote=True)}" title="{html.escape(account.email, quote=True)}"{current_attribute}>{html.escape(account.name)}</a>'
+                f'<a class="segment" href="{html.escape(listing_url(params.unread_only, params.limit, 0, account.name), quote=True)}" aria-label="{html.escape(account.name + "，" + account.email, quote=True)}" title="{html.escape(account.email, quote=True)}"{current_attribute}>{html.escape(account_labels[account.name])}</a>'
             )
         account_links = "".join(account_link_parts)
         if len(accounts) >= 2:
             current_attribute = ' aria-current="page"' if selection == "all" else ""
-            all_accounts_link = f'<a class="segment" href="{html.escape(listing_url(params.unread_only, params.limit, 0, "all"), quote=True)}"{current_attribute}>全部账户</a>'
+            all_accounts_link = f'<a class="segment" href="{html.escape(listing_url(params.unread_only, params.limit, 0, "all"), quote=True)}" aria-label="全部账户，共 {len(accounts)} 个"{current_attribute}>全部（{len(accounts)}）</a>'
             account_switcher = f'<div class="account-switcher"><span class="field-label">账户</span><nav class="segmented account-tabs" aria-label="账户切换">{all_accounts_link}{account_links}</nav></div>'
         else:
             account_switcher = ""
@@ -1741,10 +2134,10 @@ class ViewerHandler(BaseHTTPRequestHandler):
             params.unread_only, params.limit, page_data.offset, selection
         ) + "&refresh=1"
         content = f'''<header class="app-header">
-  <div>
-    <h1>本地只读邮箱查看器</h1>
-    <p class="account">{html.escape(address)} · 按日期倒序</p>
-    <div class="mailbox-state"><span class="state-chip">{selected_mode}</span><span class="state-text">共 {page_data.total} 封 · {range_text} · {page_text}</span></div>
+  <div class="header-copy">
+    <h1>{APP_TITLE}</h1>
+    {scope_summary}
+    <div class="mailbox-state"><span class="state-chip">{selected_mode}</span><span class="{state_text_class}">{state_text}</span></div>
   </div>
   <div class="header-actions"><a class="button" href="/settings">缓存设置</a><a class="button primary" href="{html.escape(refresh_url, quote=True)}">刷新列表</a></div>
 </header>
@@ -1761,12 +2154,12 @@ class ViewerHandler(BaseHTTPRequestHandler):
 {notice}
 {warnings}
 {self._pagination(page_data, params, selection)}
-<section class="mailbox" aria-label="{selected_mode}列表">
-  <div class="list-head"><span>发件人</span><span>主题</span><span>日期</span></div>
+<section class="{mailbox_class}" aria-label="{selected_mode}列表">
+  <div class="list-head"><span>发件人</span><span>主题</span>{status_heading}<span>日期</span></div>
   {listing}
 </section>
 {self._pagination(page_data, params, selection)}'''
-        self._send(page("本地只读邮箱查看器", content))
+        self._send(page(APP_TITLE, content))
 
     def _message(self, query: dict[str, list[str]]) -> None:
         uid = query.get("uid", [""])[0]
@@ -1777,20 +2170,46 @@ class ViewerHandler(BaseHTTPRequestHandler):
         return_account = query.get("return_account", [account.name])[0]
         if return_account != "all":
             find_account(return_account, runtime.accounts)
-        item = runtime.message_detail(account.name, uid)
+        item = runtime.message_detail(account.name, uid, prefer_html=True)
         attachment_box = ""
         if item.attachments:
             names = "、".join(html.escape(name) for name in item.attachments)
             attachment_box = f'<aside class="attachments"><span class="attachment-label">附件</span>（仅列出，不下载）：{names}</aside>'
+        plain_text = normalize_plain_text(item.text)
+        plain_body = html.escape(plain_text) or "（邮件没有可显示的文本正文）"
+        has_rich_body = bool(
+            item.body_format == "html"
+            and item.safe_html
+            and item.html_policy == HTML_POLICY_VERSION
+        )
+        image_notice = (
+            f'<p class="body-image-notice" role="note">本邮件中的 {item.blocked_images} 张图片已隐藏</p>'
+            if item.blocked_images > 0
+            else ""
+        )
+        if has_rich_body:
+            body_toolbar = f'''<div class="message-body-toolbar">
+  <div class="body-view-controls"><span class="field-label">正文</span><div class="segmented body-view-tabs" role="group" aria-label="正文显示方式"><button class="segment body-mode-button" type="button" data-body-mode="html" aria-pressed="true">排版版</button><button class="segment body-mode-button" type="button" data-body-mode="plain" aria-pressed="false">纯文本</button></div></div>
+  {image_notice}
+</div>'''
+            body_content = f'''{body_toolbar}
+<section class="body-panel" data-body-panel="html" aria-label="排版版正文"><iframe class="message-body-frame" title="邮件排版正文" sandbox="allow-same-origin" referrerpolicy="no-referrer" srcdoc="{_mail_body_srcdoc(item.safe_html)}"></iframe></section>
+<section class="body-panel" data-body-panel="plain" aria-label="纯文本正文" hidden><div class="body">{plain_body}</div></section>
+<dialog class="external-link-dialog" data-external-link-dialog aria-labelledby="external-link-title">
+  <div class="external-link-content"><h2 id="external-link-title">打开外部链接？</h2><p>这个地址将离开本地邮箱查看器。请确认完整地址后再继续。</p><output class="external-link-url" data-external-link-url></output><div class="external-link-actions"><form method="dialog"><button class="button" type="submit" value="cancel">取消</button></form><button class="button primary" type="button" data-open-external-link>确认打开</button></div></div>
+</dialog>'''
+        else:
+            body_content = f'''<div class="message-body-toolbar"><div class="body-view-controls"><span class="field-label">正文</span><strong>纯文本</strong></div>{image_notice}</div>
+<section class="body-panel" aria-label="纯文本正文"><div class="body">{plain_body}</div></section>'''
         back_url = listing_url(params.unread_only, params.limit, params.offset, return_account)
         content = f'''<header class="detail-header">
   <div><h1 class="detail-subject">{html.escape(item.subject)}</h1><p class="read-only-note">{html.escape(account.name)} · {html.escape(account.email)} · 只读查看，不会标为已读</p></div>
   <a class="button" href="{html.escape(back_url, quote=True)}">返回邮件列表</a>
 </header>
-<article class="message-shell">
+<article class="message-shell" data-message-body>
   <dl class="message-meta"><dt>发件人</dt><dd>{html.escape(item.sender)}</dd><dt>收件人</dt><dd>{html.escape(item.recipients)}</dd><dt>时间</dt><dd>{html.escape(item.date)}</dd></dl>
   {attachment_box}
-  <div class="body">{html.escape(item.text) or '（邮件没有可显示的文本正文）'}</div>
+  {body_content}
 </article>'''
         self._send(page(item.subject, content))
 
@@ -1920,7 +2339,7 @@ class ViewerHandler(BaseHTTPRequestHandler):
         self.send_header("X-Content-Type-Options", "nosniff")
         self.send_header("X-Frame-Options", "DENY")
         self.send_header("Referrer-Policy", "no-referrer")
-        self.send_header("Content-Security-Policy", "default-src 'none'; script-src 'self'; connect-src 'self'; style-src 'unsafe-inline'; base-uri 'none'; frame-ancestors 'none'")
+        self.send_header("Content-Security-Policy", "default-src 'none'; script-src 'self'; connect-src 'self'; frame-src 'self'; style-src 'unsafe-inline'; base-uri 'none'; frame-ancestors 'none'")
         self.end_headers()
         self.wfile.write(body)
 
@@ -2123,7 +2542,9 @@ def main() -> int:
                     )
                 print(
                     json.dumps(
-                        asdict(runtime.message_detail(account.name, args.uid)),
+                        _mail_detail_record(
+                            runtime.message_detail(account.name, args.uid)
+                        ),
                         ensure_ascii=False,
                         indent=2,
                     )
@@ -2179,7 +2600,7 @@ def main() -> int:
             except OSError as exc:
                 runtime.close()
                 raise ViewerError(f"无法启动本机网页服务：{exc}") from exc
-            print(f"本地只读邮箱查看器已启动：http://127.0.0.1:{args.port}")
+            print(f"{APP_TITLE}已启动：http://127.0.0.1:{args.port}")
             print("按 Control-C 停止。")
             try:
                 server.serve_forever()

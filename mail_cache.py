@@ -21,6 +21,14 @@ CACHE_MODES = ("memory", "metadata", "body")
 DEFAULT_CACHE_MODE = "body"
 DEFAULT_REFRESH_MINUTES = 3
 MAX_REFRESH_MINUTES = 1440
+BODY_CACHE_ENVELOPE_VERSION = 2
+_CACHEABLE_BODY_FORMATS = frozenset({"plain", "html"})
+_NON_CACHEABLE_BODY_TEXTS = frozenset(
+    {
+        "为避免下载附件，正文无法安全读取",
+        "读取邮件正文超时。",
+    }
+)
 
 
 @dataclass(frozen=True)
@@ -76,6 +84,10 @@ class CachedDetail:
     message: CachedMessage
     text: str
     attachments: tuple[str, ...]
+    body_format: str = "plain"
+    safe_html: str = ""
+    blocked_images: int = 0
+    html_policy: str = ""
 
 
 @dataclass(frozen=True)
@@ -508,17 +520,40 @@ class CacheStore:
         if AESGCM is None:
             raise RuntimeError("缺少 cryptography，无法解密正文缓存；请重新安装项目依赖。")
         try:
-            text = self._decrypt(
+            payload = self._decrypt_v2(
                 bytes(row["body_nonce"]),
                 bytes(row["body_ciphertext"]),
                 account_name,
                 uid,
             )
+            body_format, text, safe_html, blocked_images, html_policy = (
+                self._decode_body_payload(payload)
+            )
         except Exception:
-            self.delete_cached_body(account_name, uid)
-            return None
+            try:
+                text = self._decrypt_legacy(
+                    bytes(row["body_nonce"]),
+                    bytes(row["body_ciphertext"]),
+                    account_name,
+                    uid,
+                )
+            except Exception:
+                self.delete_cached_body(account_name, uid)
+                return None
+            body_format = "plain"
+            safe_html = ""
+            blocked_images = 0
+            html_policy = ""
         attachments = tuple(json.loads(str(row["attachments_json"])))
-        return CachedDetail(self._message_from_row(row), text, attachments)
+        return CachedDetail(
+            self._message_from_row(row),
+            text,
+            attachments,
+            body_format,
+            safe_html,
+            blocked_images,
+            html_policy,
+        )
 
     def store_detail(
         self,
@@ -528,30 +563,78 @@ class CacheStore:
         recipients: str,
         text: str,
         attachments: Iterable[str],
+        body_format: str = "plain",
+        safe_html: str = "",
+        blocked_images: int = 0,
+        html_policy: str = "",
+        cacheable: bool = True,
     ) -> None:
         nonce: bytes | None = None
         ciphertext: bytes | None = None
         cached_at: float | None = None
-        if self.body_cache_enabled:
-            nonce, ciphertext = self._encrypt(text, account_name, uid)
+        normalized_format = str(body_format)
+        blocked_count = max(0, int(blocked_images))
+        should_cache = (
+            self.body_cache_enabled
+            and cacheable
+            and normalized_format in _CACHEABLE_BODY_FORMATS
+            and text.strip() not in _NON_CACHEABLE_BODY_TEXTS
+        )
+        if should_cache:
+            payload = self._encode_body_payload(
+                body_format=normalized_format,
+                text=text,
+                safe_html=safe_html,
+                blocked_images=blocked_count,
+                html_policy=html_policy,
+            )
+            nonce, ciphertext = self._encrypt(payload, account_name, uid)
             cached_at = time.time()
         with self._lock, self.connection:
-            self.connection.execute(
-                """
-                UPDATE messages SET recipients=?, attachments_json=?,
-                    body_nonce=?, body_ciphertext=?, body_cached_at=?
-                WHERE account_name=? AND uid=?
-                """,
-                (
-                    recipients,
-                    json.dumps(list(attachments), ensure_ascii=False),
-                    nonce,
-                    ciphertext,
-                    cached_at,
-                    account_name,
-                    int(uid),
-                ),
-            )
+            attachments_json = json.dumps(list(attachments), ensure_ascii=False)
+            if should_cache:
+                self.connection.execute(
+                    """
+                    UPDATE messages SET recipients=?, attachments_json=?,
+                        body_nonce=?, body_ciphertext=?, body_cached_at=?
+                    WHERE account_name=? AND uid=?
+                    """,
+                    (
+                        recipients,
+                        attachments_json,
+                        nonce,
+                        ciphertext,
+                        cached_at,
+                        account_name,
+                        int(uid),
+                    ),
+                )
+            elif cacheable:
+                self.connection.execute(
+                    """
+                    UPDATE messages SET recipients=?, attachments_json=?
+                    WHERE account_name=? AND uid=?
+                    """,
+                    (recipients, attachments_json, account_name, int(uid)),
+                )
+            else:
+                self.connection.execute(
+                    """
+                    UPDATE messages SET recipients=?,
+                        attachments_json=CASE
+                            WHEN ? != '[]' THEN ?
+                            ELSE attachments_json
+                        END
+                    WHERE account_name=? AND uid=?
+                    """,
+                    (
+                        recipients,
+                        attachments_json,
+                        attachments_json,
+                        account_name,
+                        int(uid),
+                    ),
+                )
 
     def delete_cached_body(self, account_name: str, uid: str) -> None:
         with self._lock, self.connection:
@@ -567,18 +650,84 @@ class CacheStore:
         if AESGCM is None:
             raise RuntimeError("缺少 cryptography，无法加密正文缓存；请重新安装项目依赖。")
         nonce = os.urandom(12)
-        associated = f"{account_name}:{uid}".encode("utf-8")
+        associated = self._body_associated_data(account_name, uid, version=2)
         ciphertext = AESGCM(self.encryption_key).encrypt(
             nonce, text.encode("utf-8"), associated
         )
         return nonce, ciphertext
 
-    def _decrypt(self, nonce: bytes, ciphertext: bytes, account_name: str, uid: str) -> str:
+    def _decrypt_v2(
+        self, nonce: bytes, ciphertext: bytes, account_name: str, uid: str
+    ) -> str:
         if AESGCM is None:
             raise RuntimeError("缺少 cryptography，无法解密正文缓存；请重新安装项目依赖。")
-        associated = f"{account_name}:{uid}".encode("utf-8")
+        associated = self._body_associated_data(account_name, uid, version=2)
         payload = AESGCM(self.encryption_key).decrypt(nonce, ciphertext, associated)
         return payload.decode("utf-8")
+
+    def _decrypt_legacy(
+        self, nonce: bytes, ciphertext: bytes, account_name: str, uid: str
+    ) -> str:
+        if AESGCM is None:
+            raise RuntimeError("缺少 cryptography，无法解密正文缓存；请重新安装项目依赖。")
+        associated = self._body_associated_data(account_name, uid, version=1)
+        payload = AESGCM(self.encryption_key).decrypt(nonce, ciphertext, associated)
+        return payload.decode("utf-8")
+
+    @staticmethod
+    def _body_associated_data(
+        account_name: str, uid: str, *, version: int
+    ) -> bytes:
+        if version == 1:
+            return f"{account_name}:{uid}".encode("utf-8")
+        if version == 2:
+            return f"{account_name}:{uid}:body-v2".encode("utf-8")
+        raise ValueError("unsupported body cache AAD version")
+
+    @staticmethod
+    def _encode_body_payload(
+        *,
+        body_format: str,
+        text: str,
+        safe_html: str,
+        blocked_images: int,
+        html_policy: str,
+    ) -> str:
+        envelope = {
+            "v": BODY_CACHE_ENVELOPE_VERSION,
+            "policy": html_policy,
+            "format": body_format,
+            "text": text,
+            "safe_html": safe_html,
+            "blocked_images": blocked_images,
+        }
+        return json.dumps(envelope, ensure_ascii=False, separators=(",", ":"))
+
+    @staticmethod
+    def _decode_body_payload(payload: str) -> tuple[str, str, str, int, str]:
+        try:
+            envelope = json.loads(payload)
+        except (json.JSONDecodeError, TypeError) as exc:
+            raise ValueError("invalid body cache envelope") from exc
+
+        required = {"v", "policy", "format", "text", "safe_html", "blocked_images"}
+        if not isinstance(envelope, dict) or not required.issubset(envelope):
+            raise ValueError("invalid body cache envelope")
+        if envelope["v"] != BODY_CACHE_ENVELOPE_VERSION:
+            raise ValueError("unsupported body cache envelope version")
+
+        body_format = envelope["format"]
+        text = envelope["text"]
+        safe_html = envelope["safe_html"]
+        blocked_images = envelope["blocked_images"]
+        html_policy = envelope["policy"]
+        if body_format not in _CACHEABLE_BODY_FORMATS:
+            raise ValueError("invalid cached body format")
+        if not all(isinstance(value, str) for value in (text, safe_html, html_policy)):
+            raise ValueError("invalid cached body text fields")
+        if type(blocked_images) is not int or blocked_images < 0:
+            raise ValueError("invalid cached blocked image count")
+        return body_format, text, safe_html, blocked_images, html_policy
 
     @staticmethod
     def _message_from_row(row: sqlite3.Row) -> CachedMessage:
