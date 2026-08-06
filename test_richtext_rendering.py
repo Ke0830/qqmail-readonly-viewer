@@ -9,6 +9,7 @@ from qqmail_viewer import (
     BASE_SCRIPT,
     HTML_POLICY_VERSION,
     MAIL_BODY_CSP,
+    MAIL_BODY_STYLE,
     Account,
     MailDetail,
     ViewerHandler,
@@ -166,6 +167,13 @@ class RichTextRenderingTests(unittest.TestCase):
         ):
             self.assertIn(directive, document)
         self.assertIn("<body><p>safe</p></body>", document)
+
+    def test_rich_body_uses_only_the_outer_vertical_scroll(self):
+        self.assertNotIn("Math.min(1200", BASE_SCRIPT)
+        self.assertIn("Math.ceil(height) + 2", BASE_SCRIPT)
+        self.assertIn("overflow-x:auto", MAIL_BODY_STYLE)
+        self.assertIn("overflow-y:hidden", MAIL_BODY_STYLE)
+        self.assertNotIn("overflow:auto", MAIL_BODY_STYLE)
 
     def test_parent_page_csp_allows_only_local_frames(self):
         handler = object.__new__(ViewerHandler)

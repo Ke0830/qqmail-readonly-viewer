@@ -90,6 +90,8 @@ qqmail-viewer accounts
 
 ## 使用网页查看器查看邮件
 
+先完成[配置](#添加账户)
+
 启动网页：
 
 ```bash
@@ -100,6 +102,9 @@ qqmail-viewer serve
 
 ## 使用命令行查看邮件：
 
+先完成[配置](#添加账户)
+
+开始查询：
 ```bash
 qqmail-viewer list --unread --limit 20
 ```

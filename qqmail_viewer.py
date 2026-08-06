@@ -1491,7 +1491,7 @@ MAIL_BODY_CSP = (
 )
 
 MAIL_BODY_STYLE = """
-:root{color-scheme:light}*{box-sizing:border-box}html{min-width:0;background:#fff}body{min-width:0;margin:0;padding:28px;background:#fff;color:#242424;font:15px/1.65 -apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;overflow:auto;overflow-wrap:anywhere}table{max-width:none}td,th{overflow-wrap:break-word}pre{white-space:pre-wrap;overflow-wrap:anywhere}a{color:#282828;font-weight:650;text-decoration:underline;text-underline-offset:2px;overflow-wrap:anywhere}.mail-image-placeholder{display:inline-flex;align-items:center;justify-content:center;min-width:120px;min-height:52px;max-width:100%;margin:4px 0;padding:10px 14px;border:1px dashed #b8b8b8;border-radius:8px;background:#f5f5f5;color:#6b6b6b;font:13px/1.45 -apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;text-align:center;vertical-align:middle}@media(max-width:600px){body{padding:18px 16px;font-size:16px}}
+:root{color-scheme:light}*{box-sizing:border-box}html{min-width:0;background:#fff;overflow-x:hidden;overflow-y:hidden}body{min-width:0;margin:0;padding:28px;background:#fff;color:#242424;font:15px/1.65 -apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;overflow-x:auto;overflow-y:hidden;overflow-wrap:anywhere}table{max-width:none}td,th{overflow-wrap:break-word}pre{white-space:pre-wrap;overflow-wrap:anywhere}a{color:#282828;font-weight:650;text-decoration:underline;text-underline-offset:2px;overflow-wrap:anywhere}.mail-image-placeholder{display:inline-flex;align-items:center;justify-content:center;min-width:120px;min-height:52px;max-width:100%;margin:4px 0;padding:10px 14px;border:1px dashed #b8b8b8;border-radius:8px;background:#f5f5f5;color:#6b6b6b;font:13px/1.45 -apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;text-align:center;vertical-align:middle}@media(max-width:600px){body{padding:18px 16px;font-size:16px}}
 """.strip()
 
 
@@ -1616,7 +1616,7 @@ BASE_SCRIPT = """
         frameDocument.body?.scrollHeight || 0,
         frameDocument.documentElement?.scrollHeight || 0,
       );
-      frame.style.height = `${Math.min(1200, Math.max(320, Math.ceil(height)))}px`;
+      frame.style.height = `${Math.max(320, Math.ceil(height) + 2)}px`;
     } catch (_error) {
       frame.style.height = "560px";
     }
