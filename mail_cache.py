@@ -29,6 +29,7 @@ MAX_REFRESH_MINUTES = 1440
 # manifest in v3.
 BODY_CACHE_ENVELOPE_VERSION = 3
 BODY_CACHE_ENVELOPE_V2 = 2
+TRANSLATION_CACHE_ENVELOPE_VERSION = 1
 DEFAULT_IMAGE_CACHE_LIMIT_BYTES = 256 * 1024 * 1024
 DEFAULT_IMAGE_MEMORY_LIMIT_BYTES = 64 * 1024 * 1024
 _CACHEABLE_BODY_FORMATS = frozenset({"plain", "html"})
@@ -117,6 +118,20 @@ class CachedImage:
 
 
 @dataclass(frozen=True)
+class CachedTranslation:
+    account_name: str
+    uid: str
+    target_language: str
+    source_digest: str
+    subject: str
+    text: str
+    safe_html: str
+    source_language: str
+    provider_fingerprint: str
+    cached_at: float
+
+
+@dataclass(frozen=True)
 class SyncState:
     account_name: str
     uidvalidity: str
@@ -163,6 +178,9 @@ class CacheStore:
             OrderedDict()
         )
         self._image_memory_bytes = 0
+        self._translation_memory: OrderedDict[
+            tuple[str, int, str], CachedTranslation
+        ] = OrderedDict()
         self._lock = threading.RLock()
         if self.settings.cache_mode == "memory":
             database = ":memory:"
@@ -228,6 +246,18 @@ class CacheStore:
             );
             CREATE INDEX IF NOT EXISTS message_images_lru
                 ON message_images(accessed_at, created_at);
+            CREATE TABLE IF NOT EXISTS message_translations (
+                account_name TEXT NOT NULL,
+                uid INTEGER NOT NULL,
+                target_language TEXT NOT NULL,
+                source_digest TEXT NOT NULL,
+                translation_nonce BLOB NOT NULL,
+                translation_ciphertext BLOB NOT NULL,
+                cached_at REAL NOT NULL,
+                PRIMARY KEY (account_name, uid, target_language),
+                FOREIGN KEY (account_name, uid)
+                    REFERENCES messages(account_name, uid) ON DELETE CASCADE
+            );
             CREATE TABLE IF NOT EXISTS sync_state (
                 account_name TEXT PRIMARY KEY,
                 uidvalidity TEXT NOT NULL DEFAULT '',
@@ -264,7 +294,7 @@ class CacheStore:
                 "last_error": "TEXT NOT NULL DEFAULT ''",
             },
         )
-        self.connection.execute("PRAGMA user_version=3")
+        self.connection.execute("PRAGMA user_version=4")
         self.connection.commit()
 
     def _ensure_columns(self, table: str, columns: Mapping[str, str]) -> None:
@@ -351,6 +381,9 @@ class CacheStore:
                 )
                 for uid in removed:
                     self._drop_memory_images_locked(account_name=account_name, uid=uid)
+                    self._drop_memory_translations_locked(
+                        account_name=account_name, uid=uid
+                    )
             self.connection.execute(
                 "UPDATE messages SET unread=0 WHERE account_name=?", (account_name,)
             )
@@ -365,6 +398,7 @@ class CacheStore:
             self.connection.execute("DELETE FROM messages WHERE account_name=?", (account_name,))
             self.connection.execute("DELETE FROM sync_state WHERE account_name=?", (account_name,))
             self._drop_memory_images_locked(account_name=account_name)
+            self._drop_memory_translations_locked(account_name=account_name)
 
     def clear_bodies(self) -> None:
         with self._lock, self.connection:
@@ -372,7 +406,9 @@ class CacheStore:
                 "UPDATE messages SET body_nonce=NULL, body_ciphertext=NULL, body_cached_at=NULL"
             )
             self.connection.execute("DELETE FROM message_images")
+            self.connection.execute("DELETE FROM message_translations")
             self._drop_memory_images_locked()
+            self._drop_memory_translations_locked()
 
     def clear_all(self) -> None:
         with self._lock, self.connection:
@@ -382,7 +418,9 @@ class CacheStore:
             # explicit delete also covers databases created before the image
             # table was introduced and keeps the intent obvious.
             self.connection.execute("DELETE FROM message_images")
+            self.connection.execute("DELETE FROM message_translations")
             self._drop_memory_images_locked()
+            self._drop_memory_translations_locked()
 
     def mark_seeded(self, account_name: str, unread_only: bool) -> None:
         column = "unread_seeded" if unread_only else "all_seeded"
@@ -634,6 +672,156 @@ class CacheStore:
             image_resources,
         )
 
+    def cached_translation(
+        self,
+        account_name: str,
+        uid: str,
+        source_digest: str,
+        *,
+        target_language: str = "zh-Hans",
+    ) -> CachedTranslation | None:
+        key = (account_name, int(uid), target_language)
+        with self._lock:
+            memory = self._translation_memory.get(key)
+            if memory is not None:
+                if memory.source_digest == source_digest:
+                    self._translation_memory.move_to_end(key)
+                    return memory
+                self._translation_memory.pop(key, None)
+            if self.settings.cache_mode != "body":
+                return None
+            row = self.connection.execute(
+                """
+                SELECT source_digest, translation_nonce, translation_ciphertext,
+                       cached_at
+                FROM message_translations
+                WHERE account_name=? AND uid=? AND target_language=?
+                """,
+                (account_name, int(uid), target_language),
+            ).fetchone()
+        if row is None:
+            return None
+        row_digest = str(row["source_digest"])
+        if row_digest != source_digest:
+            self.delete_translation(account_name, uid, target_language=target_language)
+            return None
+        try:
+            payload = self._decrypt_translation(
+                bytes(row["translation_nonce"]),
+                bytes(row["translation_ciphertext"]),
+                account_name,
+                uid,
+                target_language,
+                source_digest,
+            )
+            value = self._decode_translation_payload(
+                payload,
+                account_name=account_name,
+                uid=uid,
+                target_language=target_language,
+                source_digest=source_digest,
+                cached_at=float(row["cached_at"]),
+            )
+        except Exception:
+            self.delete_translation(account_name, uid, target_language=target_language)
+            return None
+        with self._lock:
+            self._store_memory_translation_locked(value)
+        return value
+
+    def store_translation(
+        self,
+        account_name: str,
+        uid: str,
+        *,
+        source_digest: str,
+        subject: str,
+        text: str,
+        safe_html: str,
+        source_language: str,
+        provider_fingerprint: str,
+        target_language: str = "zh-Hans",
+    ) -> CachedTranslation:
+        if not re.fullmatch(r"[a-f0-9]{64}", source_digest):
+            raise ValueError("invalid translation source digest")
+        if not re.fullmatch(r"[a-f0-9]{64}", provider_fingerprint):
+            raise ValueError("invalid translation provider fingerprint")
+        if not target_language or len(target_language) > 32:
+            raise ValueError("invalid translation target language")
+        cached_at = time.time()
+        value = CachedTranslation(
+            account_name=account_name,
+            uid=str(uid),
+            target_language=target_language,
+            source_digest=source_digest,
+            subject=str(subject),
+            text=str(text),
+            safe_html=str(safe_html),
+            source_language=str(source_language)[:32],
+            provider_fingerprint=provider_fingerprint,
+            cached_at=cached_at,
+        )
+        payload = self._encode_translation_payload(value)
+        with self._lock, self.connection:
+            self._store_memory_translation_locked(value)
+            if self.settings.cache_mode == "body":
+                nonce, ciphertext = self._encrypt_translation(
+                    payload,
+                    account_name,
+                    uid,
+                    target_language,
+                    source_digest,
+                )
+                self.connection.execute(
+                    """
+                    INSERT INTO message_translations(
+                        account_name, uid, target_language, source_digest,
+                        translation_nonce, translation_ciphertext, cached_at
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?)
+                    ON CONFLICT(account_name, uid, target_language) DO UPDATE SET
+                        source_digest=excluded.source_digest,
+                        translation_nonce=excluded.translation_nonce,
+                        translation_ciphertext=excluded.translation_ciphertext,
+                        cached_at=excluded.cached_at
+                    """,
+                    (
+                        account_name,
+                        int(uid),
+                        target_language,
+                        source_digest,
+                        nonce,
+                        ciphertext,
+                        cached_at,
+                    ),
+                )
+        return value
+
+    def delete_translation(
+        self,
+        account_name: str,
+        uid: str,
+        *,
+        target_language: str = "zh-Hans",
+    ) -> None:
+        with self._lock, self.connection:
+            self.connection.execute(
+                """
+                DELETE FROM message_translations
+                WHERE account_name=? AND uid=? AND target_language=?
+                """,
+                (account_name, int(uid), target_language),
+            )
+            self._drop_memory_translations_locked(
+                account_name=account_name,
+                uid=uid,
+                target_language=target_language,
+            )
+
+    def clear_translations(self) -> None:
+        with self._lock, self.connection:
+            self.connection.execute("DELETE FROM message_translations")
+            self._drop_memory_translations_locked()
+
     def store_detail(
         self,
         account_name: str,
@@ -743,7 +931,14 @@ class CacheStore:
                 "DELETE FROM message_images WHERE account_name=? AND uid=?",
                 (account_name, int(uid)),
             )
+            self.connection.execute(
+                "DELETE FROM message_translations WHERE account_name=? AND uid=?",
+                (account_name, int(uid)),
+            )
             self._drop_memory_images_locked(account_name=account_name, uid=uid)
+            self._drop_memory_translations_locked(
+                account_name=account_name, uid=uid
+            )
 
     def load_image(
         self,
@@ -995,6 +1190,44 @@ class CacheStore:
         )
         return AESGCM(self.encryption_key).decrypt(nonce, ciphertext, associated)
 
+    def _encrypt_translation(
+        self,
+        payload: str,
+        account_name: str,
+        uid: str,
+        target_language: str,
+        source_digest: str,
+    ) -> tuple[bytes, bytes]:
+        if AESGCM is None:
+            raise RuntimeError("缺少 cryptography，无法加密译文缓存；请重新安装项目依赖。")
+        nonce = os.urandom(12)
+        associated = self._translation_associated_data(
+            account_name, uid, target_language, source_digest
+        )
+        ciphertext = AESGCM(self.encryption_key).encrypt(
+            nonce, payload.encode("utf-8"), associated
+        )
+        return nonce, ciphertext
+
+    def _decrypt_translation(
+        self,
+        nonce: bytes,
+        ciphertext: bytes,
+        account_name: str,
+        uid: str,
+        target_language: str,
+        source_digest: str,
+    ) -> str:
+        if AESGCM is None:
+            raise RuntimeError("缺少 cryptography，无法解密译文缓存；请重新安装项目依赖。")
+        associated = self._translation_associated_data(
+            account_name, uid, target_language, source_digest
+        )
+        payload = AESGCM(self.encryption_key).decrypt(
+            nonce, ciphertext, associated
+        )
+        return payload.decode("utf-8")
+
     @staticmethod
     def _body_associated_data(
         account_name: str, uid: str, *, version: int
@@ -1012,6 +1245,87 @@ class CacheStore:
         return (
             f"{account_name}:{uid}:image-v1:{resource_id}:{source_digest}"
         ).encode("utf-8")
+
+    @staticmethod
+    def _translation_associated_data(
+        account_name: str,
+        uid: str,
+        target_language: str,
+        source_digest: str,
+    ) -> bytes:
+        return (
+            f"{account_name}:{uid}:translation-v1:{target_language}:{source_digest}"
+        ).encode("utf-8")
+
+    @staticmethod
+    def _encode_translation_payload(value: CachedTranslation) -> str:
+        return json.dumps(
+            {
+                "v": TRANSLATION_CACHE_ENVELOPE_VERSION,
+                "target": value.target_language,
+                "subject": value.subject,
+                "text": value.text,
+                "safe_html": value.safe_html,
+                "source_language": value.source_language,
+                "provider": value.provider_fingerprint,
+            },
+            ensure_ascii=False,
+            separators=(",", ":"),
+        )
+
+    @staticmethod
+    def _decode_translation_payload(
+        payload: str,
+        *,
+        account_name: str,
+        uid: str,
+        target_language: str,
+        source_digest: str,
+        cached_at: float,
+    ) -> CachedTranslation:
+        try:
+            value = json.loads(payload)
+        except (json.JSONDecodeError, TypeError) as exc:
+            raise ValueError("invalid translation cache envelope") from exc
+        required = {
+            "v",
+            "target",
+            "subject",
+            "text",
+            "safe_html",
+            "source_language",
+            "provider",
+        }
+        if not isinstance(value, dict) or not required.issubset(value):
+            raise ValueError("invalid translation cache envelope")
+        if value["v"] != TRANSLATION_CACHE_ENVELOPE_VERSION:
+            raise ValueError("unsupported translation cache envelope")
+        text_values = (
+            value["target"],
+            value["subject"],
+            value["text"],
+            value["safe_html"],
+            value["source_language"],
+            value["provider"],
+        )
+        if not all(isinstance(item, str) for item in text_values):
+            raise ValueError("invalid translation cache text fields")
+        if value["target"] != target_language or not re.fullmatch(
+            r"[a-f0-9]{64}", value["provider"]
+        ):
+            raise ValueError("invalid translation cache metadata")
+        return CachedTranslation(
+            account_name=account_name,
+            uid=str(uid),
+            target_language=target_language,
+            source_digest=source_digest,
+            subject=value["subject"],
+            text=value["text"],
+            safe_html=value["safe_html"],
+            source_language=value["source_language"][:32],
+            provider_fingerprint=value["provider"],
+            cached_at=cached_at,
+        )
 
     @staticmethod
     def _encode_body_payload(
@@ -1176,6 +1490,31 @@ class CacheStore:
                 continue
             self._image_memory.pop(key, None)
             self._image_memory_bytes -= image.size
+
+    def _store_memory_translation_locked(
+        self, value: CachedTranslation
+    ) -> None:
+        key = (value.account_name, int(value.uid), value.target_language)
+        self._translation_memory.pop(key, None)
+        self._translation_memory[key] = value
+        while len(self._translation_memory) > 256:
+            self._translation_memory.popitem(last=False)
+
+    def _drop_memory_translations_locked(
+        self,
+        *,
+        account_name: str | None = None,
+        uid: str | None = None,
+        target_language: str | None = None,
+    ) -> None:
+        for key in tuple(self._translation_memory):
+            if account_name is not None and key[0] != account_name:
+                continue
+            if uid is not None and key[1] != int(uid):
+                continue
+            if target_language is not None and key[2] != target_language:
+                continue
+            self._translation_memory.pop(key, None)
 
     def _prune_image_cache_locked(self, max_bytes: int | None = None) -> int:
         limit = self.image_cache_limit_bytes if max_bytes is None else max(0, max_bytes)

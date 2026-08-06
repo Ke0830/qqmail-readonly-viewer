@@ -24,6 +24,7 @@ from mail_cache import (
 from mail_html import HTML_POLICY_VERSION
 from mail_mime import parse_bodystructure, safe_text_parts
 from mail_sync import SyncManager
+from mail_translation import TranslationConfig, translation_source_digest
 from qqmail_viewer import (
     Account,
     PROCESS_CSRF_TOKEN,
@@ -1425,6 +1426,168 @@ class SyncManagerTests(unittest.TestCase):
             cache.close()
 
 
+class TranslationCacheTests(unittest.TestCase):
+    @unittest.skipIf(mail_cache.AESGCM is None, "cryptography is not installed")
+    def test_body_mode_persists_encrypted_translation_and_invalidates_digest(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "mail.sqlite3"
+            key = b"t" * 32
+            cache = CacheStore(path, CacheSettings("body", 3), key)
+            cache.upsert_messages("a", [_summary("1")])
+            cached = cache.store_translation(
+                "a",
+                "1",
+                source_digest="a" * 64,
+                subject="中文主题",
+                text="中文正文",
+                safe_html="<p>中文正文</p>",
+                source_language="EN",
+                provider_fingerprint="b" * 64,
+            )
+            row = cache.connection.execute(
+                "SELECT translation_ciphertext FROM message_translations"
+            ).fetchone()
+            self.assertNotIn("中文正文".encode(), bytes(row[0]))
+            self.assertEqual(
+                cache.cached_translation("a", "1", "a" * 64), cached
+            )
+            cache.close()
+
+            reopened = CacheStore(path, CacheSettings("body", 3), key)
+            restored = reopened.cached_translation("a", "1", "a" * 64)
+            self.assertIsNotNone(restored)
+            self.assertEqual(restored.subject, "中文主题")
+            self.assertIsNone(
+                reopened.cached_translation("a", "1", "c" * 64)
+            )
+            self.assertEqual(
+                reopened.connection.execute(
+                    "SELECT COUNT(*) FROM message_translations"
+                ).fetchone()[0],
+                0,
+            )
+            reopened.close()
+
+    @unittest.skipIf(mail_cache.AESGCM is None, "cryptography is not installed")
+    def test_memory_and_metadata_modes_keep_translation_only_in_process(self):
+        for mode in ("memory", "metadata"):
+            with self.subTest(mode=mode), tempfile.TemporaryDirectory() as directory:
+                path = Path(directory) / "mail.sqlite3"
+                cache = CacheStore(path, CacheSettings(mode, 3), b"m" * 32)
+                cache.upsert_messages("a", [_summary("1")])
+                cache.store_translation(
+                    "a",
+                    "1",
+                    source_digest="a" * 64,
+                    subject="主题",
+                    text="正文",
+                    safe_html="",
+                    source_language="EN",
+                    provider_fingerprint="b" * 64,
+                )
+                self.assertIsNotNone(
+                    cache.cached_translation("a", "1", "a" * 64)
+                )
+                self.assertEqual(
+                    cache.connection.execute(
+                        "SELECT COUNT(*) FROM message_translations"
+                    ).fetchone()[0],
+                    0,
+                )
+                cache.close()
+
+    @unittest.skipIf(mail_cache.AESGCM is None, "cryptography is not installed")
+    def test_body_clear_and_translation_only_clear_remove_translations(self):
+        with tempfile.TemporaryDirectory() as directory:
+            cache = CacheStore(
+                Path(directory) / "mail.sqlite3",
+                CacheSettings("body", 3),
+                b"c" * 32,
+            )
+            cache.upsert_messages("a", [_summary("1")])
+            values = {
+                "source_digest": "a" * 64,
+                "subject": "主题",
+                "text": "正文",
+                "safe_html": "",
+                "source_language": "EN",
+                "provider_fingerprint": "b" * 64,
+            }
+            cache.store_translation("a", "1", **values)
+            cache.clear_translations()
+            self.assertIsNone(cache.cached_translation("a", "1", "a" * 64))
+            cache.store_translation("a", "1", **values)
+            cache.clear_bodies()
+            self.assertIsNone(cache.cached_translation("a", "1", "a" * 64))
+            cache.close()
+
+    @unittest.skipIf(mail_cache.AESGCM is None, "cryptography is not installed")
+    def test_runtime_translates_on_demand_and_reuses_cached_result(self):
+        with tempfile.TemporaryDirectory() as directory, patch(
+            "qqmail_viewer.configured_client"
+        ):
+            runtime = ViewerRuntime(
+                periodic=False,
+                accounts=(WebAndSettingsTests.ACCOUNT,),
+                settings=CacheSettings("body", 3),
+                cache_file=Path(directory) / "mail.sqlite3",
+                encryption_key=b"r" * 32,
+            )
+            runtime._translation_config = TranslationConfig(
+                "openai_compatible", "https://api.example.com/v1", "model"
+            ).validated()
+            runtime._translation_config_loaded = True
+            runtime.cache.upsert_messages("a", [_summary("1")])
+            runtime.cache.store_detail(
+                "a",
+                "1",
+                recipients="reader@example.com",
+                text="Hello body",
+                attachments=(),
+                body_format="html",
+                safe_html="<p>Hello body</p>",
+                html_policy=HTML_POLICY_VERSION,
+            )
+            calls = []
+
+            def transport(_url, body, _headers, _deadline):
+                request = json.loads(body)
+                segments = json.loads(request["messages"][1]["content"])["segments"]
+                calls.append(segments)
+                payload = {
+                    "source_language": "EN",
+                    "translations": [
+                        {
+                            "id": item["id"],
+                            "text": item["text"].replace("message 1", "邮件一").replace(
+                                "Hello body", "你好正文"
+                            ),
+                        }
+                        for item in segments
+                    ],
+                }
+                return {
+                    "choices": [{"message": {"content": json.dumps(payload)}}]
+                }
+
+            with patch(
+                "qqmail_viewer._keychain_get_optional", return_value="secret"
+            ):
+                translated = runtime.translate_message(
+                    "a", "1", transport=transport
+                )
+                cached = runtime.translate_message(
+                    "a",
+                    "1",
+                    transport=lambda *_args: self.fail("cache miss"),
+                )
+            self.assertEqual(translated.subject, "邮件一")
+            self.assertEqual(translated.text, "你好正文")
+            self.assertEqual(cached, translated)
+            self.assertEqual(len(calls), 1)
+            runtime.close()
+
+
 class WebAndSettingsTests(unittest.TestCase):
     ACCOUNT = Account(
         "a", "custom", "a@example.com", "imap.example.com", 993, "email-a", "auth-a", True
@@ -1503,6 +1666,129 @@ class WebAndSettingsTests(unittest.TestCase):
             aggregate = json.loads(output.getvalue())
         self.assertEqual(set(aggregate), {"messages", "errors"})
         self.assertEqual(aggregate["messages"][0]["account"]["name"], "a")
+
+    @unittest.skipIf(mail_cache.AESGCM is None, "cryptography is not installed")
+    def test_message_translation_dialog_and_cached_chinese_default_view(self):
+        with tempfile.TemporaryDirectory() as directory, patch(
+            "qqmail_viewer.configured_client"
+        ):
+            runtime = ViewerRuntime(
+                periodic=False,
+                accounts=(self.ACCOUNT,),
+                settings=CacheSettings("body", 3),
+                cache_file=Path(directory) / "mail.sqlite3",
+                encryption_key=b"w" * 32,
+            )
+            runtime.cache.upsert_messages("a", [_summary("1")])
+            runtime.cache.store_detail(
+                "a",
+                "1",
+                recipients="reader@example.com",
+                text="Hello body",
+                attachments=(),
+                body_format="html",
+                safe_html='<p>Hello <a href="https://example.com">open</a></p>',
+                html_policy=HTML_POLICY_VERSION,
+            )
+            runtime._translation_config = None
+            runtime._translation_config_loaded = True
+            handler = object.__new__(ViewerHandler)
+            handler.server = SimpleNamespace(runtime=runtime)
+            handler._send = MagicMock()
+            query = {
+                "account": ["a"],
+                "uid": ["1"],
+                "return_account": ["a"],
+            }
+            handler._message(query)
+            unconfigured = handler._send.call_args.args[0].decode()
+            self.assertIn("data-translation-config-open", unconfigured)
+            self.assertIn("绑定翻译 API", unconfigured)
+            self.assertIn("邮件主题和正文会发送给该服务", unconfigured)
+            self.assertNotIn('value="secret"', unconfigured)
+
+            runtime._translation_config = TranslationConfig(
+                "openai_compatible", "https://api.example.com/v1", "model"
+            ).validated()
+            item = runtime.message_detail("a", "1", prefer_html=True)
+            digest = translation_source_digest(
+                subject=item.subject,
+                text=item.text,
+                safe_html=item.safe_html,
+                html_policy=item.html_policy,
+            )
+            runtime.cache.store_translation(
+                "a",
+                "1",
+                source_digest=digest,
+                subject="中文主题",
+                text="你好正文",
+                safe_html='<p>你好 <a href="https://example.com">打开</a></p>',
+                source_language="EN",
+                provider_fingerprint=runtime._translation_config.fingerprint(),
+            )
+            handler._message(query)
+            translated = handler._send.call_args.args[0].decode()
+            self.assertIn("<title>中文主题</title>", translated)
+            self.assertIn(">中文主题</h1>", translated)
+            self.assertIn("中文翻译", translated)
+            self.assertIn("原文排版", translated)
+            self.assertIn("原文纯文本", translated)
+            self.assertIn('data-body-mode="translated" aria-pressed="true"', translated)
+            self.assertIn("重新翻译", translated)
+            self.assertIn("修改 API", translated)
+            self.assertNotIn("data-translation-dialog", translated)
+
+            handler._settings({})
+            settings = handler._send.call_args.args[0].decode()
+            self.assertIn("缓存、同步与翻译设置", settings)
+            self.assertIn("OpenAI 兼容接口", settings)
+            self.assertIn("https://api.example.com/v1", settings)
+            self.assertIn("只清除译文缓存", settings)
+            self.assertNotIn('value="secret"', settings)
+            runtime.close()
+
+    def test_translation_post_routes_share_csrf_protection(self):
+        payload = b"csrf=wrong&scope=settings"
+        for path in (
+            "/translation/configure",
+            "/translation/run",
+            "/translation/disconnect",
+            "/translation/cache/clear",
+        ):
+            with self.subTest(path=path):
+                handler = object.__new__(ViewerHandler)
+                handler.path = path
+                handler.headers = {"Content-Length": str(len(payload))}
+                handler.rfile = io.BytesIO(payload)
+                handler._send = MagicMock()
+                handler.do_POST()
+                self.assertEqual(handler._send.call_args.args[1], 403)
+
+    def test_translation_run_redirects_with_message_context(self):
+        runtime = SimpleNamespace(
+            accounts=(self.ACCOUNT,), translate_message=MagicMock()
+        )
+        handler = object.__new__(ViewerHandler)
+        handler._runtime = MagicMock(return_value=runtime)
+        handler._redirect = MagicMock()
+        handler._translation_run_post(
+            {
+                "scope": ["message"],
+                "account": ["a"],
+                "uid": ["7"],
+                "return_account": ["a"],
+                "unread": ["0"],
+                "limit": ["50"],
+                "page": ["3"],
+                "force": ["1"],
+            }
+        )
+        runtime.translate_message.assert_called_once_with("a", "7", force=True)
+        location = handler._redirect.call_args.args[0]
+        self.assertIn("/message?", location)
+        self.assertIn("translation=done", location)
+        self.assertIn("page=3", location)
 
     def test_invalid_csrf_is_rejected(self):
         payload = b"csrf=wrong&action=clear_all"

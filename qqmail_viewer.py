@@ -41,6 +41,7 @@ from mail_cache import (
     CacheSettings,
     CacheStore,
     CachedMessage,
+    CachedTranslation,
     default_cache_path,
 )
 from mail_html import (
@@ -67,6 +68,14 @@ from mail_mime import (
     select_body_plan,
 )
 from mail_sync import SyncManager, cached_web_body_is_current
+from mail_translation import (
+    TRANSLATION_TARGET,
+    TranslationConfig,
+    TranslationError,
+    translate_mail_content,
+    translation_source_digest,
+    validate_api_key,
+)
 
 
 # Kept as public compatibility constants for integrations that imported them.
@@ -78,6 +87,8 @@ AUTH_SERVICE = "codex.qqmail-viewer.authorization-code"
 ACCOUNT_INDEX_SERVICE = "codex.qqmail-viewer.account-index.v2"
 SETTINGS_SERVICE = "codex.qqmail-viewer.settings.v1"
 CACHE_KEY_SERVICE = "codex.qqmail-viewer.cache-encryption-key.v1"
+TRANSLATION_CONFIG_SERVICE = "codex.qqmail-viewer.translation-config.v1"
+TRANSLATION_KEY_SERVICE = "codex.qqmail-viewer.translation-api-key.v1"
 PROCESS_CSRF_TOKEN = secrets.token_urlsafe(32)
 DEFAULT_LIMIT = 30
 MAX_LIMIT = 100
@@ -93,6 +104,11 @@ PROVIDER_TAB_LABELS = {
     "yeah": "yeah",
     "icloud": "iCloud",
     "gmail": "Gmail",
+}
+TRANSLATION_PROVIDER_LABELS = {
+    "deepl_free": "DeepL Free",
+    "deepl_pro": "DeepL Pro",
+    "openai_compatible": "OpenAI 兼容接口",
 }
 
 
@@ -423,6 +439,16 @@ def _windows_credential_set(service: str, value: str) -> None:
         raise ViewerError(f"无法写入 Windows 凭据管理器：{exc}") from exc
 
 
+def _windows_credential_delete(service: str) -> None:
+    keyring = _windows_keyring()
+    try:
+        if keyring.get_password(service, KEYCHAIN_ACCOUNT) is None:
+            return
+        keyring.delete_password(service, KEYCHAIN_ACCOUNT)
+    except Exception as exc:
+        raise ViewerError(f"无法从 Windows 凭据管理器删除凭据：{exc}") from exc
+
+
 def _windows_keyring():
     try:
         import keyring
@@ -472,6 +498,24 @@ def keychain_set(service: str, value: str) -> None:
     )
 
 
+def keychain_delete(service: str) -> None:
+    _ensure_supported_platform()
+    if sys.platform == "win32":
+        _windows_credential_delete(service)
+        return
+    if _keychain_get_optional(service) is None:
+        return
+    _security(
+        [
+            "delete-generic-password",
+            "-a",
+            KEYCHAIN_ACCOUNT,
+            "-s",
+            service,
+        ]
+    )
+
+
 def _keychain_get_optional(service: str) -> str | None:
     """Return a credential when present, without exposing a missing-item error."""
     try:
@@ -504,6 +548,46 @@ def save_settings(settings: CacheSettings) -> None:
         SETTINGS_SERVICE,
         json.dumps(validated.public_record(), ensure_ascii=False, separators=(",", ":")),
     )
+
+
+def load_translation_config() -> TranslationConfig | None:
+    raw = _keychain_get_optional(TRANSLATION_CONFIG_SERVICE)
+    if raw is None:
+        return None
+    try:
+        value = json.loads(raw)
+        if not isinstance(value, dict):
+            raise TypeError
+        return TranslationConfig(
+            provider=str(value["provider"]),
+            base_url=str(value.get("base_url", "")),
+            model=str(value.get("model", "")),
+        ).validated()
+    except (json.JSONDecodeError, KeyError, TypeError, TranslationError) as exc:
+        raise ViewerError("翻译服务配置无法读取，请在设置页重新绑定。") from exc
+
+
+def save_translation_config(config: TranslationConfig, api_key: str) -> None:
+    try:
+        validated = config.validated()
+        validated_key = validate_api_key(validated, api_key)
+    except TranslationError as exc:
+        raise ViewerError(str(exc)) from exc
+    if validated_key:
+        keychain_set(TRANSLATION_KEY_SERVICE, validated_key)
+    else:
+        keychain_delete(TRANSLATION_KEY_SERVICE)
+    keychain_set(
+        TRANSLATION_CONFIG_SERVICE,
+        json.dumps(
+            validated.public_record(), ensure_ascii=False, separators=(",", ":")
+        ),
+    )
+
+
+def delete_translation_config() -> None:
+    keychain_delete(TRANSLATION_CONFIG_SERVICE)
+    keychain_delete(TRANSLATION_KEY_SERVICE)
 
 
 def _cache_encryption_key() -> tuple[bytes, bool]:
@@ -1362,6 +1446,9 @@ class ViewerRuntime:
         else:
             self.encryption_key, key_created = encryption_key, False
         self._lock = threading.RLock()
+        self._translation_config: TranslationConfig | None = None
+        self._translation_config_loaded = False
+        self._translation_locks: dict[tuple[str, str], threading.Lock] = {}
         self.cache = CacheStore(self.cache_file, self.settings, self.encryption_key)
         self.image_tokens = _ImageTokenStore()
         self.remote_images = RemoteImageFetcher()
@@ -1384,9 +1471,122 @@ class ViewerRuntime:
             self.image_tokens.clear()
             self.cache.close()
 
-    def materialize_html(self, account_name: str, uid: str, item: MailDetail) -> str:
-        if not item.safe_html or not item.image_resources:
-            return item.safe_html
+    @property
+    def translation_config(self) -> TranslationConfig | None:
+        with self._lock:
+            if not self._translation_config_loaded:
+                self._translation_config = load_translation_config()
+                self._translation_config_loaded = True
+            return self._translation_config
+
+    def configure_translation(
+        self, config: TranslationConfig, api_key: str
+    ) -> TranslationConfig:
+        try:
+            validated = config.validated()
+        except TranslationError as exc:
+            raise ViewerError(str(exc)) from exc
+        save_translation_config(validated, api_key)
+        with self._lock:
+            self._translation_config = validated
+            self._translation_config_loaded = True
+        return validated
+
+    def disconnect_translation(self) -> None:
+        delete_translation_config()
+        with self._lock:
+            self._translation_config = None
+            self._translation_config_loaded = True
+
+    def cached_translation_for(
+        self, account_name: str, uid: str, item: MailDetail
+    ) -> CachedTranslation | None:
+        digest = translation_source_digest(
+            subject=item.subject,
+            text=item.text,
+            safe_html=item.safe_html,
+            html_policy=item.html_policy,
+        )
+        try:
+            return self.cache.cached_translation(
+                account_name, uid, digest, target_language=TRANSLATION_TARGET
+            )
+        except RuntimeError as exc:
+            raise ViewerError(str(exc)) from exc
+
+    def translate_message(
+        self,
+        account_name: str,
+        uid: str,
+        *,
+        force: bool = False,
+        transport=None,
+    ) -> CachedTranslation:
+        if not uid.isdigit():
+            raise ViewerError("邮件 UID 无效。")
+        key = (account_name, uid)
+        with self._lock:
+            translation_lock = self._translation_locks.setdefault(
+                key, threading.Lock()
+            )
+        with translation_lock:
+            item = self.message_detail(account_name, uid, prefer_html=True)
+            if not force:
+                cached = self.cached_translation_for(account_name, uid, item)
+                if cached is not None:
+                    return cached
+            config = self.translation_config
+            if config is None:
+                raise ViewerError("尚未绑定翻译 API。")
+            api_key = _keychain_get_optional(TRANSLATION_KEY_SERVICE) or ""
+            try:
+                translated = translate_mail_content(
+                    config,
+                    api_key,
+                    subject=item.subject,
+                    text=item.text,
+                    safe_html=(
+                        item.safe_html
+                        if item.body_format == "html"
+                        and item.html_policy == HTML_POLICY_VERSION
+                        else ""
+                    ),
+                    transport=transport,
+                )
+            except TranslationError as exc:
+                raise ViewerError(str(exc)) from exc
+            digest = translation_source_digest(
+                subject=item.subject,
+                text=item.text,
+                safe_html=item.safe_html,
+                html_policy=item.html_policy,
+            )
+            try:
+                return self.cache.store_translation(
+                    account_name,
+                    uid,
+                    source_digest=digest,
+                    subject=translated.subject,
+                    text=translated.text,
+                    safe_html=translated.safe_html,
+                    source_language=translated.source_language,
+                    provider_fingerprint=config.fingerprint(),
+                    target_language=TRANSLATION_TARGET,
+                )
+            except (RuntimeError, ValueError) as exc:
+                raise ViewerError(f"译文缓存写入失败：{exc}") from exc
+
+    def materialize_html(
+        self,
+        account_name: str,
+        uid: str,
+        item: MailDetail,
+        *,
+        safe_html: str | None = None,
+    ) -> str:
+        source_html = item.safe_html if safe_html is None else safe_html
+        if not source_html or not item.image_resources:
+            return source_html
         urls: dict[str, object] = {}
         for resource in item.image_resources:
             resource_id = str(resource.get("id", ""))
@@ -1396,7 +1596,7 @@ class ViewerRuntime:
             value: object = f"/message-image/{token}"
             descriptor = str(resource.get("descriptor", ""))
             urls[resource_id] = (value, descriptor)
-        return materialize_image_placeholders(item.safe_html, urls)
+        return materialize_image_placeholders(source_html, urls)
 
     def image_for_token(self, token: str):
         resolved = self.image_tokens.resolve(token)
@@ -1769,15 +1969,34 @@ def _mail_body_srcdoc(safe_html: str) -> str:
     return html.escape(document, quote=True)
 
 
+def _translation_config_fields(
+    current: TranslationConfig | None = None,
+) -> str:
+    selected = current.provider if current is not None else "deepl_free"
+    options = "".join(
+        f'<option value="{provider}"{" selected" if provider == selected else ""}>{label}</option>'
+        for provider, label in TRANSLATION_PROVIDER_LABELS.items()
+    )
+    show_openai = selected == "openai_compatible"
+    base_url = current.base_url if current is not None and show_openai else ""
+    model = current.model if current is not None and show_openai else ""
+    hidden = "" if show_openai else " hidden"
+    return f'''<label class="translation-field"><span class="field-label">翻译服务</span><select class="select" name="provider" data-translation-provider>{options}</select></label>
+<label class="translation-field" data-openai-field{hidden}><span class="field-label">Base URL</span><input class="text-input" name="base_url" type="url" maxlength="2048" value="{html.escape(base_url, quote=True)}" placeholder="https://api.openai.com/v1"><span class="form-help">远程接口必须使用 HTTPS；本机 Ollama 可使用 http://127.0.0.1:11434/v1。</span></label>
+<label class="translation-field" data-openai-field{hidden}><span class="field-label">模型名称</span><input class="text-input" name="model" maxlength="200" value="{html.escape(model, quote=True)}" placeholder="例如 gpt-4.1-mini 或本机模型名称"></label>
+<label class="translation-field"><span class="field-label">API Key</span><input class="text-input" name="api_key" type="password" maxlength="4096" autocomplete="off" spellcheck="false"><span class="form-help">DeepL 和远程接口必须填写；本机 Ollama 可以留空。密钥只写入系统凭据库，页面无法读回。</span></label>'''
+
+
 BASE_STYLE = """
 :root{color-scheme:light dark;--canvas:#fff;--surface:#fff;--surface-raised:#f5f5f5;--ink:#242424;--muted:#6b6b6b;--quiet:#969696;--line:#e6e6e6;--line-strong:#d4d4d4;--accent:#282828;--accent-ink:#fff;--accent-wash:#ededed;--danger:#9b2d30;--danger-wash:#fff2f2;--shadow:0 18px 42px rgba(0,0,0,.06)}
 @media(prefers-color-scheme:dark){:root{--canvas:#191919;--surface:#202020;--surface-raised:#292929;--ink:#f2f2f2;--muted:#b5b5b5;--quiet:#858585;--line:#343434;--line-strong:#4a4a4a;--accent:#d9d9d9;--accent-ink:#1b1b1b;--accent-wash:#303030;--danger:#ffb6b6;--danger-wash:#392126;--shadow:0 18px 42px rgba(0,0,0,.24)}}
-*{box-sizing:border-box}body{margin:0;background:var(--canvas);color:var(--ink);font:15px/1.55 -apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif}button,input,select{font:inherit}a{color:inherit}main{max-width:1160px;margin:0 auto;padding:48px 26px 76px}h1,h2,p{margin:0}.app-header{display:flex;align-items:flex-end;justify-content:space-between;gap:28px;padding-bottom:26px;border-bottom:1px solid var(--line)}.header-copy{flex:1;min-width:0}h1{font-size:clamp(26px,4vw,34px);line-height:1.12;letter-spacing:-.025em}.account{margin-top:8px;color:var(--muted);overflow-wrap:anywhere}.account-summary{display:flex;align-items:baseline;flex-wrap:wrap;gap:4px 7px;min-height:22px;margin-top:9px}.account-summary-name{color:var(--ink);font-size:15px;font-weight:700;white-space:nowrap}.account-summary-count,.account-summary-detail{min-width:0;color:var(--muted);font-size:13px;overflow-wrap:anywhere}.account-summary-separator{color:var(--quiet);font-size:12px}.mailbox-state{display:flex;align-items:center;flex-wrap:wrap;gap:8px;margin-top:16px}.state-chip{flex:0 0 auto;padding:4px 9px;border-radius:999px;background:var(--accent-wash);color:var(--accent);font-size:13px;font-weight:700}.state-text{display:grid;grid-template-columns:72px 132px 96px max-content;align-items:center;color:var(--muted);font-size:13px;font-variant-numeric:tabular-nums}.state-stat{position:relative;white-space:nowrap}.state-stat:not(:last-child)::after{content:"·";position:absolute;right:7px;color:var(--quiet)}.state-text-empty{grid-template-columns:188px max-content}.control-bar{display:flex;align-items:center;justify-content:space-between;gap:16px;padding:18px 0}.filter-group,.pagination,.jump-form,.account-switcher,.page-size-switcher{display:flex;align-items:center;gap:8px;flex-wrap:wrap}.segmented{display:flex;padding:3px;border:1px solid var(--line);border-radius:11px;background:var(--surface-raised)}.account-tabs,.page-size-tabs{flex-wrap:wrap}.segment{padding:7px 11px;border-radius:8px;text-decoration:none;color:var(--muted);font-size:14px;font-weight:650}.segment[aria-current="page"],.segment[aria-pressed="true"]{background:var(--surface);box-shadow:0 2px 7px rgba(30,44,67,.12);color:var(--ink)}.field-label{color:var(--muted);font-size:13px;font-weight:650}.select,.page-input{height:35px;border:1px solid var(--line-strong);border-radius:8px;background:var(--surface);color:var(--ink);padding:0 9px}.page-input{width:52px;text-align:center}.button,.page-link{min-height:35px;display:inline-flex;align-items:center;justify-content:center;padding:0 11px;border:1px solid var(--line-strong);border-radius:8px;background:var(--surface);color:var(--ink);text-decoration:none;cursor:pointer;font-weight:650;font-size:14px}.button.primary{background:var(--accent);border-color:var(--accent);color:var(--accent-ink)}.button:hover,.page-link:hover{border-color:var(--accent);color:var(--accent)}.button.primary:hover{filter:brightness(1.06);color:var(--accent-ink)}.page-link.disabled{border-color:var(--line);background:var(--surface-raised);color:var(--quiet);cursor:default}.pagination{justify-content:space-between;padding:15px 0}.page-controls{display:flex;align-items:center;gap:7px;flex-wrap:wrap}.page-status{color:var(--muted);font-size:14px;font-weight:650}.mailbox{border-top:1px solid var(--line);border-bottom:1px solid var(--line);background:var(--surface);box-shadow:var(--shadow)}.list-head,.mail{display:grid;grid-template-columns:minmax(220px,1.12fr) minmax(280px,1.85fr) 148px;gap:24px;align-items:center}.list-head{padding:10px 20px;background:var(--surface-raised);border-bottom:1px solid var(--line);color:var(--muted);font-size:12px;font-weight:750;letter-spacing:.04em}.mail{min-height:72px;padding:13px 20px;border-bottom:1px solid var(--line);text-decoration:none;position:relative;transition:background .16s ease,box-shadow .16s ease}.mail:last-child{border-bottom:0}.mail:hover{background:color-mix(in srgb,var(--accent) 6%,var(--surface))}.mail:focus-visible{outline:3px solid color-mix(in srgb,var(--accent) 55%,transparent);outline-offset:-3px;z-index:1}.sender{display:grid;gap:3px}.mail-address-row{display:grid;grid-template-columns:52px minmax(0,1fr);gap:8px;align-items:baseline;min-width:0}.mail-address-label{color:var(--quiet);font-size:11px;font-weight:750;line-height:1.4;white-space:nowrap}.recipient-account{margin-top:3px}.recipient-account .mail-address-label{color:var(--muted)}.sender-name{display:block;color:var(--ink);font-weight:650;overflow-wrap:anywhere}.sender-address,.account-tag{display:block;color:var(--muted);font-size:13px;overflow-wrap:anywhere}.sender-address-primary{color:var(--ink);font-size:15px;font-weight:650}.account-tag{font-size:12px}.subject{font-weight:700;overflow-wrap:anywhere;line-height:1.4}.date{color:var(--muted);font-variant-numeric:tabular-nums;white-space:nowrap;text-align:right}.empty-state,.error-state{padding:64px 24px;text-align:center;background:var(--surface)}.empty-state h2,.error-state h2{font-size:20px}.empty-state p,.error-state p{max-width:48ch;margin:8px auto 0;color:var(--muted)}.notice{margin:0 0 14px;padding:10px 13px;border:1px solid var(--line-strong);background:var(--surface-raised);color:var(--muted);font-size:14px}.notice.warning{border-color:var(--line-strong)}.detail-header{display:flex;align-items:flex-start;justify-content:space-between;gap:24px;padding-bottom:22px;border-bottom:1px solid var(--line)}.detail-subject{max-width:800px;font-size:clamp(24px,3.6vw,32px);overflow-wrap:anywhere}.read-only-note{margin-top:8px;color:var(--muted)}.message-shell{width:100%;max-width:930px;margin-top:28px;background:var(--surface);box-shadow:var(--shadow)}.message-meta{display:grid;grid-template-columns:90px minmax(0,1fr);gap:10px 22px;padding:24px;border-bottom:1px solid var(--line)}.message-meta dt{color:var(--muted);font-weight:650}.message-meta dd{margin:0;overflow-wrap:anywhere}.attachments{margin:20px 24px 0;padding:13px 15px;border:1px solid var(--line);background:var(--surface-raised)}.attachment-label{font-weight:750}.message-body-toolbar{display:flex;align-items:center;justify-content:space-between;gap:16px;padding:18px 24px 12px}.body-view-controls{display:flex;align-items:center;gap:8px;flex-wrap:wrap}.body-view-tabs{display:inline-flex}.body-mode-button{border:0;background:transparent;cursor:pointer}.body-image-notice{color:var(--muted);font-size:13px}.body-panel{min-width:0;border-top:1px solid var(--line)}.body-panel[hidden]{display:none}.message-body-frame{display:block;width:100%;height:320px;min-height:320px;border:0;background:#fff}.body{max-width:76ch;min-height:260px;margin:0;padding:28px 24px 34px;white-space:pre-wrap;overflow-wrap:anywhere;font:15px/1.75 -apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;unicode-bidi:plaintext}.external-link-dialog{width:min(560px,calc(100vw - 32px));padding:0;border:1px solid var(--line-strong);border-radius:14px;background:var(--surface);color:var(--ink);box-shadow:0 24px 64px rgba(0,0,0,.24)}.external-link-dialog::backdrop{background:rgba(0,0,0,.46)}.external-link-content{padding:24px}.external-link-content h2{font-size:20px}.external-link-content p{margin-top:8px;color:var(--muted)}.external-link-url{display:block;max-height:150px;margin-top:16px;padding:11px 12px;overflow:auto;border:1px solid var(--line);background:var(--surface-raised);font:13px/1.55 ui-monospace,SFMono-Regular,Menlo,monospace;overflow-wrap:anywhere;white-space:pre-wrap}.external-link-actions{display:flex;justify-content:flex-end;gap:8px;margin-top:20px}.external-link-actions form{margin:0}.error-state{max-width:700px;margin:72px auto;box-shadow:var(--shadow)}.error-state h2{color:var(--danger)}.error-state .button{margin-top:20px}
+*{box-sizing:border-box}body{margin:0;background:var(--canvas);color:var(--ink);font:15px/1.55 -apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif}button,input,select{font:inherit}a{color:inherit}main{max-width:1160px;margin:0 auto;padding:48px 26px 76px}h1,h2,p{margin:0}.app-header{display:flex;align-items:flex-end;justify-content:space-between;gap:28px;padding-bottom:26px;border-bottom:1px solid var(--line)}.header-copy{flex:1;min-width:0}h1{font-size:clamp(26px,4vw,34px);line-height:1.12;letter-spacing:-.025em}.account{margin-top:8px;color:var(--muted);overflow-wrap:anywhere}.account-summary{display:flex;align-items:baseline;flex-wrap:wrap;gap:4px 7px;min-height:22px;margin-top:9px}.account-summary-name{color:var(--ink);font-size:15px;font-weight:700;white-space:nowrap}.account-summary-count,.account-summary-detail{min-width:0;color:var(--muted);font-size:13px;overflow-wrap:anywhere}.account-summary-separator{color:var(--quiet);font-size:12px}.mailbox-state{display:flex;align-items:center;flex-wrap:wrap;gap:8px;margin-top:16px}.state-chip{flex:0 0 auto;padding:4px 9px;border-radius:999px;background:var(--accent-wash);color:var(--accent);font-size:13px;font-weight:700}.state-text{display:grid;grid-template-columns:72px 132px 96px max-content;align-items:center;color:var(--muted);font-size:13px;font-variant-numeric:tabular-nums}.state-stat{position:relative;white-space:nowrap}.state-stat:not(:last-child)::after{content:"·";position:absolute;right:7px;color:var(--quiet)}.state-text-empty{grid-template-columns:188px max-content}.control-bar{display:flex;align-items:center;justify-content:space-between;gap:16px;padding:18px 0}.filter-group,.pagination,.jump-form,.account-switcher,.page-size-switcher{display:flex;align-items:center;gap:8px;flex-wrap:wrap}.segmented{display:flex;padding:3px;border:1px solid var(--line);border-radius:11px;background:var(--surface-raised)}.account-tabs,.page-size-tabs{flex-wrap:wrap}.segment{padding:7px 11px;border-radius:8px;text-decoration:none;color:var(--muted);font-size:14px;font-weight:650}.segment[aria-current="page"],.segment[aria-pressed="true"]{background:var(--surface);box-shadow:0 2px 7px rgba(30,44,67,.12);color:var(--ink)}.field-label{color:var(--muted);font-size:13px;font-weight:650}.select,.page-input{height:35px;border:1px solid var(--line-strong);border-radius:8px;background:var(--surface);color:var(--ink);padding:0 9px}.page-input{width:52px;text-align:center}.button,.page-link{min-height:35px;display:inline-flex;align-items:center;justify-content:center;padding:0 11px;border:1px solid var(--line-strong);border-radius:8px;background:var(--surface);color:var(--ink);text-decoration:none;cursor:pointer;font-weight:650;font-size:14px}.button.primary{background:var(--accent);border-color:var(--accent);color:var(--accent-ink)}.button:hover,.page-link:hover{border-color:var(--accent);color:var(--accent)}.button.primary:hover{filter:brightness(1.06);color:var(--accent-ink)}.page-link.disabled{border-color:var(--line);background:var(--surface-raised);color:var(--quiet);cursor:default}.pagination{justify-content:space-between;padding:15px 0}.page-controls{display:flex;align-items:center;gap:7px;flex-wrap:wrap}.page-status{color:var(--muted);font-size:14px;font-weight:650}.mailbox{border-top:1px solid var(--line);border-bottom:1px solid var(--line);background:var(--surface);box-shadow:var(--shadow)}.list-head,.mail{display:grid;grid-template-columns:minmax(220px,1.12fr) minmax(280px,1.85fr) 148px;gap:24px;align-items:center}.list-head{padding:10px 20px;background:var(--surface-raised);border-bottom:1px solid var(--line);color:var(--muted);font-size:12px;font-weight:750;letter-spacing:.04em}.mail{min-height:72px;padding:13px 20px;border-bottom:1px solid var(--line);text-decoration:none;position:relative;transition:background .16s ease,box-shadow .16s ease}.mail:last-child{border-bottom:0}.mail:hover{background:color-mix(in srgb,var(--accent) 6%,var(--surface))}.mail:focus-visible{outline:3px solid color-mix(in srgb,var(--accent) 55%,transparent);outline-offset:-3px;z-index:1}.sender{display:grid;gap:3px}.mail-address-row{display:grid;grid-template-columns:52px minmax(0,1fr);gap:8px;align-items:baseline;min-width:0}.mail-address-label{color:var(--quiet);font-size:11px;font-weight:750;line-height:1.4;white-space:nowrap}.recipient-account{margin-top:3px}.recipient-account .mail-address-label{color:var(--muted)}.sender-name{display:block;color:var(--ink);font-weight:650;overflow-wrap:anywhere}.sender-address,.account-tag{display:block;color:var(--muted);font-size:13px;overflow-wrap:anywhere}.sender-address-primary{color:var(--ink);font-size:15px;font-weight:650}.account-tag{font-size:12px}.subject{font-weight:700;overflow-wrap:anywhere;line-height:1.4}.date{color:var(--muted);font-variant-numeric:tabular-nums;white-space:nowrap;text-align:right}.empty-state,.error-state{padding:64px 24px;text-align:center;background:var(--surface)}.empty-state h2,.error-state h2{font-size:20px}.empty-state p,.error-state p{max-width:48ch;margin:8px auto 0;color:var(--muted)}.notice{margin:0 0 14px;padding:10px 13px;border:1px solid var(--line-strong);background:var(--surface-raised);color:var(--muted);font-size:14px}.notice.warning{border-color:var(--line-strong)}.detail-header{display:flex;align-items:flex-start;justify-content:space-between;gap:24px;padding-bottom:22px;border-bottom:1px solid var(--line)}.detail-subject{max-width:800px;font-size:clamp(24px,3.6vw,32px);overflow-wrap:anywhere}.read-only-note{margin-top:8px;color:var(--muted)}.message-shell{width:100%;max-width:930px;margin:28px auto 0;background:var(--surface);box-shadow:var(--shadow)}.message-meta{display:grid;grid-template-columns:90px minmax(0,1fr);gap:10px 22px;padding:24px;border-bottom:1px solid var(--line)}.message-meta dt{color:var(--muted);font-weight:650}.message-meta dd{margin:0;overflow-wrap:anywhere}.attachments{margin:20px 24px 0;padding:13px 15px;border:1px solid var(--line);background:var(--surface-raised)}.attachment-label{font-weight:750}.message-body-toolbar{display:flex;align-items:center;justify-content:space-between;gap:16px;padding:18px 24px 12px}.body-view-controls{display:flex;align-items:center;gap:8px;flex-wrap:wrap}.body-view-tabs{display:inline-flex}.body-mode-button{border:0;background:transparent;cursor:pointer}.body-image-notice{color:var(--muted);font-size:13px}.body-panel{min-width:0;border-top:1px solid var(--line)}.body-panel[hidden]{display:none}.message-body-frame{display:block;width:100%;height:320px;min-height:320px;border:0;background:#fff}.body{max-width:76ch;min-height:260px;margin:0;padding:28px 24px 34px;white-space:pre-wrap;overflow-wrap:anywhere;font:15px/1.75 -apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;unicode-bidi:plaintext}.external-link-dialog{width:min(560px,calc(100vw - 32px));padding:0;border:1px solid var(--line-strong);border-radius:14px;background:var(--surface);color:var(--ink);box-shadow:0 24px 64px rgba(0,0,0,.24)}.external-link-dialog::backdrop{background:rgba(0,0,0,.46)}.external-link-content{padding:24px}.external-link-content h2{font-size:20px}.external-link-content p{margin-top:8px;color:var(--muted)}.external-link-url{display:block;max-height:150px;margin-top:16px;padding:11px 12px;overflow:auto;border:1px solid var(--line);background:var(--surface-raised);font:13px/1.55 ui-monospace,SFMono-Regular,Menlo,monospace;overflow-wrap:anywhere;white-space:pre-wrap}.external-link-actions{display:flex;justify-content:flex-end;gap:8px;margin-top:20px}.external-link-actions form{margin:0}.error-state{max-width:700px;margin:72px auto;box-shadow:var(--shadow)}.error-state h2{color:var(--danger)}.error-state .button{margin-top:20px}
 .segmented{position:relative;isolation:isolate}.segment{position:relative;z-index:1;transition:color .16s ease}.segmented.is-sliding .segment[aria-current="page"]{background:transparent;box-shadow:none}.segment-slider{position:absolute;z-index:0;border-radius:8px;background:var(--surface);pointer-events:none;will-change:transform}.segment.is-transition-source{color:var(--muted)}.segment.is-transition-target{color:var(--ink)}
 .sender,.subject{min-width:0}.subject-text{display:block;min-width:0;overflow-wrap:anywhere}.mailbox-with-status .list-head,.mailbox-with-status .mail{grid-template-columns:minmax(0,1.12fr) minmax(0,1.85fr) 52px 148px}.status-head{text-align:center}.message-status{justify-self:center;min-width:44px;padding:2px 6px;border:1px solid var(--line-strong);border-radius:8px;background:var(--surface-raised);color:var(--muted);font-size:13px;font-weight:750;line-height:1.2;text-align:center;white-space:nowrap}.mail-unread{background:color-mix(in srgb,var(--accent) 4%,var(--surface))}.mail-unread .sender-name,.mail-unread .subject-text{font-weight:750}.mail-unread .message-status{border-color:var(--accent);background:var(--accent);color:var(--accent-ink)}.mail-read .sender-name,.mail-read .subject-text{color:var(--muted);font-weight:500}
 @media(prefers-reduced-motion:reduce){.segment{transition:none}}
-@media(max-width:780px){main{padding:28px 16px 52px}.app-header,.detail-header{display:block}.account-summary{gap:3px 6px}.mailbox-state{display:block}.state-text{grid-template-columns:112px minmax(0,1fr);gap:4px 12px;margin-top:8px}.state-stat::after{display:none}.state-text-empty{grid-template-columns:1fr}.control-bar{align-items:flex-start;flex-direction:column}.pagination{align-items:flex-start;flex-direction:column}.list-head{display:none}.mail{grid-template-columns:minmax(0,1fr);gap:5px;padding:15px 16px}.subject{grid-column:1;grid-row:1}.mail .sender{grid-column:1;grid-row:2}.date{grid-column:1;grid-row:3;margin-top:2px;text-align:left;white-space:normal;font-size:13px}.mailbox-with-status .mail{grid-template-columns:52px minmax(0,1fr)}.mailbox-with-status .subject,.mailbox-with-status .mail .sender{grid-column:1 / -1}.mailbox-with-status .message-status{grid-column:1;grid-row:3;justify-self:start}.mailbox-with-status .date{grid-column:2;grid-row:3;justify-self:end;margin-top:0;text-align:right}.sender-name{font-size:14px}.sender-address{max-width:100%;white-space:normal;overflow-wrap:anywhere}.message-shell{margin-top:22px}.message-meta{grid-template-columns:1fr;gap:2px;padding:20px}.message-meta dt:not(:first-child){margin-top:12px}.message-body-toolbar{align-items:flex-start;flex-direction:column;padding:16px 20px 10px}.message-body-frame{height:520px}.body{padding:24px 20px}.jump-form{width:100%}.page-input{width:64px}}
-.header-actions{display:flex;align-items:center;gap:8px;flex-wrap:wrap}.number-input{width:110px;height:35px;border:1px solid var(--line-strong);border-radius:8px;background:var(--surface);color:var(--ink);padding:0 9px}.button.danger{border-color:var(--danger);color:var(--danger)}.button:focus-visible,.page-link:focus-visible,.select:focus-visible,.page-input:focus-visible,.number-input:focus-visible,.segment:focus-visible,.body-mode-button:focus-visible{outline:3px solid color-mix(in srgb,var(--accent) 55%,transparent);outline-offset:2px}.settings-header{display:flex;justify-content:space-between;align-items:flex-start;gap:24px;padding-bottom:24px;border-bottom:1px solid var(--line)}.settings-shell{max-width:760px;margin-top:28px;display:grid;gap:18px}.settings-card{padding:24px;background:var(--surface);border:1px solid var(--line);box-shadow:var(--shadow)}.settings-card h2{font-size:20px}.settings-card p{margin-top:7px;color:var(--muted)}.settings-form{display:grid;gap:18px;margin-top:20px}.form-row{display:grid;grid-template-columns:180px minmax(0,1fr);gap:16px;align-items:center}.form-help{display:block;margin-top:5px;color:var(--muted);font-size:13px}.settings-actions{display:flex;gap:8px;flex-wrap:wrap;padding-top:4px}.danger-zone{border-color:color-mix(in srgb,var(--danger) 35%,var(--line))}.inline-form{display:inline-flex;margin:14px 8px 0 0}@media(max-width:780px){.settings-header{display:block}.header-actions{margin-top:18px}.form-row{grid-template-columns:1fr;gap:6px}.settings-card{padding:20px}}
+@media(max-width:780px){main{padding:28px 16px 52px}.app-header,.detail-header{display:block}.account-summary{gap:3px 6px}.mailbox-state{display:block}.state-text{grid-template-columns:112px minmax(0,1fr);gap:4px 12px;margin-top:8px}.state-stat::after{display:none}.state-text-empty{grid-template-columns:1fr}.control-bar{align-items:flex-start;flex-direction:column}.pagination{align-items:flex-start;flex-direction:column}.list-head{display:none}.mail{grid-template-columns:minmax(0,1fr);gap:5px;padding:15px 16px}.subject{grid-column:1;grid-row:1}.mail .sender{grid-column:1;grid-row:2}.date{grid-column:1;grid-row:3;margin-top:2px;text-align:left;white-space:normal;font-size:13px}.mailbox-with-status .mail{grid-template-columns:52px minmax(0,1fr)}.mailbox-with-status .subject,.mailbox-with-status .mail .sender{grid-column:1 / -1}.mailbox-with-status .message-status{grid-column:1;grid-row:3;justify-self:start}.mailbox-with-status .date{grid-column:2;grid-row:3;justify-self:end;margin-top:0;text-align:right}.sender-name{font-size:14px}.sender-address{max-width:100%;white-space:normal;overflow-wrap:anywhere}.message-shell{margin:22px auto 0}.message-meta{grid-template-columns:1fr;gap:2px;padding:20px}.message-meta dt:not(:first-child){margin-top:12px}.message-body-toolbar{align-items:flex-start;flex-direction:column;padding:16px 20px 10px}.message-body-frame{height:520px}.body{padding:24px 20px}.jump-form{width:100%}.page-input{width:64px}}
+.header-actions{display:flex;align-items:center;gap:8px;flex-wrap:wrap}.number-input{width:110px;height:35px;border:1px solid var(--line-strong);border-radius:8px;background:var(--surface);color:var(--ink);padding:0 9px}.button.danger{border-color:var(--danger);color:var(--danger)}.button:focus-visible,.page-link:focus-visible,.select:focus-visible,.page-input:focus-visible,.number-input:focus-visible,.text-input:focus-visible,.segment:focus-visible,.body-mode-button:focus-visible{outline:3px solid color-mix(in srgb,var(--accent) 55%,transparent);outline-offset:2px}.settings-header{display:flex;justify-content:space-between;align-items:flex-start;gap:24px;padding-bottom:24px;border-bottom:1px solid var(--line)}.settings-shell{max-width:760px;margin-top:28px;display:grid;gap:18px}.settings-card{padding:24px;background:var(--surface);border:1px solid var(--line);box-shadow:var(--shadow)}.settings-card h2{font-size:20px}.settings-card p{margin-top:7px;color:var(--muted)}.settings-form{display:grid;gap:18px;margin-top:20px}.form-row{display:grid;grid-template-columns:180px minmax(0,1fr);gap:16px;align-items:center}.form-help{display:block;margin-top:5px;color:var(--muted);font-size:13px}.settings-actions{display:flex;gap:8px;flex-wrap:wrap;padding-top:4px}.danger-zone{border-color:color-mix(in srgb,var(--danger) 35%,var(--line))}.inline-form{display:inline-flex;margin:14px 8px 0 0}@media(max-width:780px){.settings-header{display:block}.header-actions{margin-top:18px}.form-row{grid-template-columns:1fr;gap:6px}.settings-card{padding:20px}}
+.translation-toolbar-side,.translation-actions{display:flex;align-items:center;justify-content:flex-end;gap:8px;flex-wrap:wrap}.translation-actions form{margin:0}.translation-status{max-width:930px;margin:18px auto 0}.button[disabled]{cursor:wait;opacity:.62}.translation-dialog{width:min(620px,calc(100vw - 32px));max-height:calc(100vh - 40px);padding:0;overflow:auto;border:0;border-radius:11px;background:var(--surface);color:var(--ink);box-shadow:var(--shadow)}.translation-dialog::backdrop{background:color-mix(in srgb,var(--ink) 46%,transparent)}.translation-dialog-content{padding:24px}.translation-dialog-content h2{font-size:20px}.translation-dialog-content>p{margin-top:8px;color:var(--muted)}.translation-config-form{display:grid;gap:16px;margin-top:20px}.translation-field{display:grid;gap:6px}.translation-field[hidden]{display:none}.text-input{width:100%;min-width:0;height:38px;padding:0 10px;border:1px solid var(--line-strong);border-radius:8px;background:var(--surface);color:var(--ink)}.translation-disclosure{padding:11px 12px;background:var(--surface-raised);color:var(--muted);font-size:13px}.translation-provider-status{display:flex;align-items:baseline;gap:8px;flex-wrap:wrap;margin-top:14px}.translation-provider-status strong{overflow-wrap:anywhere}.settings-inline-actions{display:flex;align-items:center;gap:8px;flex-wrap:wrap;margin-top:16px}.settings-inline-actions form{margin:0}@media(max-width:780px){.translation-toolbar-side{align-items:flex-start;justify-content:flex-start;flex-direction:column}.translation-actions{justify-content:flex-start}.translation-dialog-content{padding:20px}.text-input,.translation-config-form .select{font-size:16px}}
 """
 
 
@@ -1814,6 +2033,7 @@ BASE_SCRIPT = """
     currentMain.replaceWith(nextPage.main);
     document.title = nextPage.title;
     initializeMessageBodies();
+    initializeTranslationControls();
     if (pushHistory) {
       window.history.pushState({mailViewer: true}, "", nextPage.url);
     }
@@ -1968,13 +2188,26 @@ BASE_SCRIPT = """
           panels.forEach((panel) => {
             panel.hidden = panel.getAttribute("data-body-panel") !== mode;
           });
-          const frame = shell.querySelector(".message-body-frame:not([hidden])");
+          const activePanel = panels.find(
+            (panel) => panel.getAttribute("data-body-panel") === mode,
+          );
+          const frame = activePanel?.querySelector(".message-body-frame");
           if (frame instanceof HTMLIFrameElement) resizeMessageFrame(frame);
+          const subject = document.querySelector("[data-detail-subject]");
+          if (subject instanceof HTMLElement) {
+            const value = mode === "translated"
+              ? subject.dataset.translatedSubject
+              : subject.dataset.originalSubject;
+            if (value) {
+              subject.textContent = value;
+              document.title = value;
+            }
+          }
         });
       });
 
-      const frame = shell.querySelector(".message-body-frame");
-      if (frame instanceof HTMLIFrameElement) {
+      shell.querySelectorAll(".message-body-frame").forEach((frame) => {
+        if (!(frame instanceof HTMLIFrameElement)) return;
         const wireFrame = () => {
           resizeMessageFrame(frame);
           try {
@@ -2014,7 +2247,7 @@ BASE_SCRIPT = """
         if (frame.contentDocument?.readyState === "complete") {
           window.setTimeout(wireFrame, 0);
         }
-      }
+      });
 
       const dialog = shell.querySelector("[data-external-link-dialog]");
       const openButton = dialog?.querySelector("[data-open-external-link]");
@@ -2040,6 +2273,64 @@ BASE_SCRIPT = """
           dialog.close();
         });
       }
+    });
+  };
+
+  const initializeTranslationControls = () => {
+    document.querySelectorAll("[data-translation-config-form]").forEach((form) => {
+      if (!(form instanceof HTMLFormElement) || form.dataset.initialized === "true") return;
+      form.dataset.initialized = "true";
+      const provider = form.querySelector("[data-translation-provider]");
+      const openAIFields = Array.from(form.querySelectorAll("[data-openai-field]"));
+      const updateFields = () => {
+        const showOpenAI = provider instanceof HTMLSelectElement
+          && provider.value === "openai_compatible";
+        openAIFields.forEach((field) => {
+          field.hidden = !showOpenAI;
+          field.querySelectorAll("input").forEach((input) => {
+            input.disabled = !showOpenAI;
+          });
+        });
+      };
+      provider?.addEventListener("change", updateFields);
+      updateFields();
+    });
+
+    document.querySelectorAll("[data-translation-config-open]").forEach((button) => {
+      if (!(button instanceof HTMLButtonElement) || button.dataset.initialized === "true") return;
+      button.dataset.initialized = "true";
+      button.addEventListener("click", () => {
+        const dialog = document.querySelector("[data-translation-dialog]");
+        if (typeof HTMLDialogElement !== "undefined" && dialog instanceof HTMLDialogElement) {
+          dialog.showModal();
+          const firstField = dialog.querySelector("select, input");
+          if (firstField instanceof HTMLElement) firstField.focus();
+        } else {
+          window.location.assign(button.dataset.settingsHref || "/settings#translation");
+        }
+      });
+    });
+
+    document.querySelectorAll("[data-translation-dialog-close]").forEach((button) => {
+      if (!(button instanceof HTMLButtonElement) || button.dataset.initialized === "true") return;
+      button.dataset.initialized = "true";
+      button.addEventListener("click", () => {
+        const dialog = button.closest("dialog");
+        if (dialog instanceof HTMLDialogElement) dialog.close();
+      });
+    });
+
+    document.querySelectorAll("[data-translation-submit]").forEach((form) => {
+      if (!(form instanceof HTMLFormElement) || form.dataset.submitInitialized === "true") return;
+      form.dataset.submitInitialized = "true";
+      form.addEventListener("submit", () => {
+        form.setAttribute("aria-busy", "true");
+        form.querySelectorAll('button[type="submit"]').forEach((button) => {
+          if (!(button instanceof HTMLButtonElement)) return;
+          button.disabled = true;
+          button.textContent = button.dataset.loadingLabel || "正在翻译…";
+        });
+      });
     });
   };
 
@@ -2107,6 +2398,7 @@ BASE_SCRIPT = """
     });
   });
   initializeMessageBodies();
+  initializeTranslationControls();
 })();
 """
 
@@ -2166,7 +2458,15 @@ class ViewerHandler(BaseHTTPRequestHandler):
     def do_POST(self) -> None:  # noqa: N802
         route = urlparse(self.path)
         try:
-            if route.path != "/settings":
+            handlers = {
+                "/settings": self._settings_post,
+                "/translation/configure": self._translation_configure_post,
+                "/translation/run": self._translation_run_post,
+                "/translation/disconnect": self._translation_disconnect_post,
+                "/translation/cache/clear": self._translation_cache_clear_post,
+            }
+            handler = handlers.get(route.path)
+            if handler is None:
                 self._send(page("未找到", ""), HTTPStatus.NOT_FOUND)
                 return
             try:
@@ -2189,9 +2489,116 @@ class ViewerHandler(BaseHTTPRequestHandler):
                     HTTPStatus.FORBIDDEN,
                 )
                 return
-            self._settings_post(form)
+            handler(form)
         except (UnicodeDecodeError, ViewerError) as exc:
             self._error_page(route, ViewerError(str(exc)), HTTPStatus.BAD_REQUEST)
+
+    def _translation_return_url(
+        self,
+        form: dict[str, list[str]],
+        *,
+        status: str,
+        detail: str = "",
+    ) -> str:
+        scope = form.get("scope", ["settings"])[0]
+        if scope != "message":
+            values = {"translation": status}
+            if detail:
+                values["translation_detail"] = detail[:400]
+            return f"/settings?{urlencode(values)}#translation"
+        runtime = self._runtime()
+        account_name = form.get("account", [""])[0]
+        return_account = form.get("return_account", [account_name])[0]
+        account = find_account(account_name, runtime.accounts)
+        if return_account != "all":
+            find_account(return_account, runtime.accounts)
+        uid = form.get("uid", [""])[0]
+        if not uid.isdigit():
+            raise ViewerError("邮件 UID 无效。")
+        params = parse_listing_params(form)
+        values: dict[str, object] = {
+            "account": account.name,
+            "uid": uid,
+            "return_account": return_account,
+            "unread": "1" if params.unread_only else "0",
+            "limit": params.limit,
+            "page": params.requested_page,
+            "translation": status,
+        }
+        if detail:
+            values["translation_detail"] = detail[:400]
+        return f"/message?{urlencode(values)}"
+
+    @staticmethod
+    def _translation_config_from_form(
+        form: dict[str, list[str]],
+    ) -> tuple[TranslationConfig, str]:
+        provider = form.get("provider", [""])[0]
+        config = TranslationConfig(
+            provider=provider,
+            base_url=(
+                form.get("base_url", [""])[0]
+                if provider == "openai_compatible"
+                else ""
+            ),
+            model=(
+                form.get("model", [""])[0]
+                if provider == "openai_compatible"
+                else ""
+            ),
+        )
+        return config, form.get("api_key", [""])[0]
+
+    def _translation_configure_post(
+        self, form: dict[str, list[str]]
+    ) -> None:
+        runtime = self._runtime()
+        try:
+            config, api_key = self._translation_config_from_form(form)
+            runtime.configure_translation(config, api_key)
+            if form.get("scope", ["settings"])[0] == "message":
+                runtime.translate_message(
+                    form.get("account", [""])[0],
+                    form.get("uid", [""])[0],
+                    force=True,
+                )
+        except ViewerError as exc:
+            self._redirect(
+                self._translation_return_url(
+                    form, status="error", detail=str(exc)
+                )
+            )
+            return
+        self._redirect(self._translation_return_url(form, status="saved"))
+
+    def _translation_run_post(self, form: dict[str, list[str]]) -> None:
+        runtime = self._runtime()
+        try:
+            runtime.translate_message(
+                form.get("account", [""])[0],
+                form.get("uid", [""])[0],
+                force=form.get("force", ["0"])[0] == "1",
+            )
+        except ViewerError as exc:
+            self._redirect(
+                self._translation_return_url(
+                    form, status="error", detail=str(exc)
+                )
+            )
+            return
+        self._redirect(self._translation_return_url(form, status="done"))
+
+    def _translation_disconnect_post(
+        self, form: dict[str, list[str]]
+    ) -> None:
+        self._runtime().disconnect_translation()
+        self._redirect(self._translation_return_url(form, status="disconnected"))
+
+    def _translation_cache_clear_post(
+        self, form: dict[str, list[str]]
+    ) -> None:
+        self._runtime().cache.clear_translations()
+        self._redirect(self._translation_return_url(form, status="cleared"))
 
     def _error_page(
         self,
@@ -2459,7 +2866,7 @@ class ViewerHandler(BaseHTTPRequestHandler):
     {scope_summary}
     <div class="mailbox-state"><span class="state-chip">{selected_mode}</span><span class="{state_text_class}">{state_text}</span></div>
   </div>
-  <div class="header-actions"><a class="button" href="/settings">缓存设置</a><a class="button primary" href="{html.escape(refresh_url, quote=True)}">刷新列表</a></div>
+  <div class="header-actions"><a class="button" href="/settings">设置</a><a class="button primary" href="{html.escape(refresh_url, quote=True)}">刷新列表</a></div>
 </header>
 <div class="control-bar">
   <div class="filter-group">
@@ -2491,6 +2898,13 @@ class ViewerHandler(BaseHTTPRequestHandler):
         if return_account != "all":
             find_account(return_account, runtime.accounts)
         item = runtime.message_detail(account.name, uid, prefer_html=True)
+        cached_translation_for = getattr(runtime, "cached_translation_for", None)
+        translation = (
+            cached_translation_for(account.name, uid, item)
+            if callable(cached_translation_for)
+            else None
+        )
+        translation_config = getattr(runtime, "translation_config", None)
         attachment_box = ""
         if item.attachments:
             names = "、".join(html.escape(name) for name in item.attachments)
@@ -2508,6 +2922,18 @@ class ViewerHandler(BaseHTTPRequestHandler):
             if has_rich_body and callable(materialize_html)
             else (item.safe_html if has_rich_body else "")
         )
+        translated_html = ""
+        if translation is not None and translation.safe_html:
+            translated_html = (
+                materialize_html(
+                    account.name,
+                    uid,
+                    item,
+                    safe_html=translation.safe_html,
+                )
+                if callable(materialize_html)
+                else translation.safe_html
+            )
         image_count = len(item.image_resources)
         hidden_images = max(0, item.blocked_images - image_count)
         image_notice = (
@@ -2519,31 +2945,83 @@ class ViewerHandler(BaseHTTPRequestHandler):
                 else ""
             )
         )
+        context_inputs = f'''<input type="hidden" name="csrf" value="{html.escape(PROCESS_CSRF_TOKEN, quote=True)}">
+<input type="hidden" name="scope" value="message"><input type="hidden" name="account" value="{html.escape(account.name, quote=True)}"><input type="hidden" name="uid" value="{html.escape(uid, quote=True)}"><input type="hidden" name="return_account" value="{html.escape(return_account, quote=True)}"><input type="hidden" name="unread" value="{'1' if params.unread_only else '0'}"><input type="hidden" name="limit" value="{params.limit}"><input type="hidden" name="page" value="{params.requested_page}">'''
+        if translation_config is not None:
+            action_label = "重新翻译" if translation is not None else "翻译为中文"
+            translation_actions = f'''<div class="translation-actions"><form method="post" action="/translation/run" data-translation-submit>{context_inputs}<input type="hidden" name="force" value="{'1' if translation is not None else '0'}"><button class="button primary" type="submit" data-loading-label="正在翻译…">{action_label}</button></form><a class="button" href="/settings#translation">修改 API</a></div>'''
+        else:
+            open_label = "绑定 API" if translation is not None else "翻译为中文"
+            translation_actions = f'''<div class="translation-actions"><button class="button primary" type="button" data-translation-config-open data-settings-href="/settings#translation">{open_label}</button><noscript><a class="button" href="/settings#translation">配置翻译 API</a></noscript></div>'''
+
+        tabs: list[str] = []
+        panels: list[str] = []
+        default_mode = "translated" if translation is not None else (
+            "html" if has_rich_body else "plain"
+        )
+        if translation is not None:
+            tabs.append('<button class="segment body-mode-button" type="button" data-body-mode="translated" aria-pressed="true">中文翻译</button>')
+            translated_body = html.escape(
+                normalize_plain_text(translation.text)
+            ) or "（译文没有可显示的文本正文）"
+            if translated_html:
+                panels.append(
+                    f'<section class="body-panel" data-body-panel="translated" aria-label="中文翻译正文"><iframe class="message-body-frame" title="中文翻译正文" sandbox="allow-same-origin" referrerpolicy="no-referrer" srcdoc="{_mail_body_srcdoc(translated_html)}"></iframe></section>'
+                )
+            else:
+                panels.append(
+                    f'<section class="body-panel" data-body-panel="translated" aria-label="中文翻译正文"><div class="body">{translated_body}</div></section>'
+                )
         if has_rich_body:
-            body_toolbar = f'''<div class="message-body-toolbar">
-  <div class="body-view-controls"><span class="field-label">正文</span><div class="segmented body-view-tabs" role="group" aria-label="正文显示方式"><button class="segment body-mode-button" type="button" data-body-mode="html" aria-pressed="true">排版版</button><button class="segment body-mode-button" type="button" data-body-mode="plain" aria-pressed="false">纯文本</button></div></div>
-  {image_notice}
+            rich_label = "原文排版" if translation is not None else "排版版"
+            tabs.append(
+                f'<button class="segment body-mode-button" type="button" data-body-mode="html" aria-pressed="{"true" if default_mode == "html" else "false"}">{rich_label}</button>'
+            )
+            panels.append(
+                f'<section class="body-panel" data-body-panel="html" aria-label="原文排版正文"{"" if default_mode == "html" else " hidden"}><iframe class="message-body-frame" title="邮件原文排版正文" sandbox="allow-same-origin" referrerpolicy="no-referrer" srcdoc="{_mail_body_srcdoc(rendered_html)}"></iframe></section>'
+            )
+        plain_label = "原文纯文本" if translation is not None else "纯文本"
+        tabs.append(
+            f'<button class="segment body-mode-button" type="button" data-body-mode="plain" aria-pressed="{"true" if default_mode == "plain" else "false"}">{plain_label}</button>'
+        )
+        panels.append(
+            f'<section class="body-panel" data-body-panel="plain" aria-label="原文纯文本正文"{"" if default_mode == "plain" else " hidden"}><div class="body">{plain_body}</div></section>'
+        )
+        body_toolbar = f'''<div class="message-body-toolbar">
+  <div class="body-view-controls"><span class="field-label">正文</span><div class="segmented body-view-tabs" role="group" aria-label="正文显示方式">{"".join(tabs)}</div></div>
+  <div class="translation-toolbar-side">{image_notice}{translation_actions}</div>
 </div>'''
-            body_content = f'''{body_toolbar}
-<section class="body-panel" data-body-panel="html" aria-label="排版版正文"><iframe class="message-body-frame" title="邮件排版正文" sandbox="allow-same-origin" referrerpolicy="no-referrer" srcdoc="{_mail_body_srcdoc(rendered_html)}"></iframe></section>
-<section class="body-panel" data-body-panel="plain" aria-label="纯文本正文" hidden><div class="body">{plain_body}</div></section>
+        body_content = f'''{body_toolbar}
+{"".join(panels)}
 <dialog class="external-link-dialog" data-external-link-dialog aria-labelledby="external-link-title">
   <div class="external-link-content"><h2 id="external-link-title">打开外部链接？</h2><p>这个地址将离开本地邮箱查看器。请确认完整地址后再继续。</p><output class="external-link-url" data-external-link-url></output><div class="external-link-actions"><form method="dialog"><button class="button" type="submit" value="cancel">取消</button></form><button class="button primary" type="button" data-open-external-link>确认打开</button></div></div>
 </dialog>'''
-        else:
-            body_content = f'''<div class="message-body-toolbar"><div class="body-view-controls"><span class="field-label">正文</span><strong>纯文本</strong></div>{image_notice}</div>
-<section class="body-panel" aria-label="纯文本正文"><div class="body">{plain_body}</div></section>'''
+        translation_dialog = ""
+        if translation_config is None:
+            translation_dialog = f'''<dialog class="translation-dialog" data-translation-dialog aria-labelledby="translation-dialog-title"><div class="translation-dialog-content"><h2 id="translation-dialog-title">绑定翻译 API</h2><p>选择你自己的翻译服务。邮件主题和正文会发送给该服务，项目不会提供或共享 API Key。</p><form class="translation-config-form" method="post" action="/translation/configure" data-translation-config-form data-translation-submit>{context_inputs}{_translation_config_fields()}<p class="translation-disclosure">只发送当前邮件的主题与可见正文；不发送发件人、收件人、附件、图片、链接地址或邮箱密码。</p><div class="settings-actions"><button class="button" type="button" data-translation-dialog-close>取消</button><button class="button primary" type="submit" data-loading-label="正在保存并翻译…">保存并翻译</button></div></form></div></dialog>'''
+        translation_status = ""
+        status_value = query.get("translation", [""])[0]
+        if status_value in {"done", "saved"}:
+            translation_status = '<p class="notice translation-status" role="status">中文译文已生成并缓存。</p>'
+        elif status_value == "error":
+            reason = query.get("translation_detail", ["翻译服务暂时不可用，请稍后重试。"])[0]
+            translation_status = f'<p class="notice warning translation-status" role="alert">翻译失败：{html.escape(reason)}</p>'
+        elif status_value == "disconnected":
+            translation_status = '<p class="notice translation-status" role="status">翻译 API 已解绑，已有译文仍保留。</p>'
         back_url = listing_url(params.unread_only, params.limit, params.offset, return_account)
+        displayed_subject = translation.subject if translation is not None else item.subject
         content = f'''<header class="detail-header">
-  <div><h1 class="detail-subject">{html.escape(item.subject)}</h1><p class="read-only-note">{html.escape(account.name)} · {html.escape(account.email)} · 只读查看，不会标为已读</p></div>
+  <div><h1 class="detail-subject" data-detail-subject data-original-subject="{html.escape(item.subject, quote=True)}" data-translated-subject="{html.escape(translation.subject if translation is not None else '', quote=True)}">{html.escape(displayed_subject)}</h1><p class="read-only-note">{html.escape(account.name)} · {html.escape(account.email)} · 只读查看，不会标为已读</p></div>
   <a class="button" href="{html.escape(back_url, quote=True)}">返回邮件列表</a>
 </header>
+{translation_status}
 <article class="message-shell" data-message-body>
   <dl class="message-meta"><dt>发件人</dt><dd>{html.escape(item.sender)}</dd><dt>收件人</dt><dd>{html.escape(item.recipients)}</dd><dt>时间</dt><dd>{html.escape(item.date)}</dd></dl>
   {attachment_box}
   {body_content}
-</article>'''
-        self._send(page(item.subject, content))
+</article>
+{translation_dialog}'''
+        self._send(page(displayed_subject, content))
 
     def _api_messages(self, query: dict[str, list[str]]) -> None:
         params = parse_listing_params(query)
@@ -2586,13 +3064,27 @@ class ViewerHandler(BaseHTTPRequestHandler):
     def _settings(self, query: dict[str, list[str]]) -> None:
         runtime = self._runtime()
         current = runtime.settings
-        status = ""
+        translation_config = runtime.translation_config
+        statuses: list[str] = []
         if query.get("saved") == ["1"]:
-            status = '<p class="notice" role="status">缓存设置已保存。</p>'
+            statuses.append('<p class="notice" role="status">缓存设置已保存。</p>')
         elif query.get("cleared") == ["bodies"]:
-            status = '<p class="notice" role="status">已清除正文缓存，邮件元数据仍保留。</p>'
+            statuses.append('<p class="notice" role="status">已清除正文、图片和译文缓存，邮件元数据仍保留。</p>')
         elif query.get("cleared") == ["all"]:
-            status = '<p class="notice" role="status">已清除全部邮件缓存，后台将重新建立索引。</p>'
+            statuses.append('<p class="notice" role="status">已清除全部邮件缓存，后台将重新建立索引。</p>')
+        translation_status = query.get("translation", [""])[0]
+        if translation_status == "saved":
+            statuses.append('<p class="notice" role="status">翻译 API 已绑定。</p>')
+        elif translation_status == "disconnected":
+            statuses.append('<p class="notice" role="status">翻译 API 已解绑，已有译文仍保留。</p>')
+        elif translation_status == "cleared":
+            statuses.append('<p class="notice" role="status">译文缓存已清除。</p>')
+        elif translation_status == "error":
+            reason = query.get("translation_detail", ["翻译配置无法保存，请检查后重试。"])[0]
+            statuses.append(
+                f'<p class="notice warning" role="alert">翻译设置失败：{html.escape(reason)}</p>'
+            )
+        status = "".join(statuses)
         options = "".join(
             f'<option value="{mode}"{" selected" if current.cache_mode == mode else ""}>{label}</option>'
             for mode, label in (
@@ -2602,7 +3094,20 @@ class ViewerHandler(BaseHTTPRequestHandler):
             )
         )
         token = html.escape(PROCESS_CSRF_TOKEN, quote=True)
-        content = f'''<header class="settings-header"><div><h1>缓存与同步设置</h1><p class="account">设置由网页与 CLI 共用，保存在本机系统凭据库中。</p></div><a class="button" href="/">返回邮件列表</a></header>
+        if translation_config is None:
+            provider_status = '<div class="translation-provider-status"><strong>尚未绑定</strong><span class="form-help">首次翻译时也可以直接在邮件详情页绑定。</span></div>'
+        else:
+            provider_label = TRANSLATION_PROVIDER_LABELS.get(
+                translation_config.provider, translation_config.provider
+            )
+            provider_detail = ""
+            if translation_config.provider == "openai_compatible":
+                provider_detail = f'<span class="form-help">{html.escape(translation_config.base_url)} · {html.escape(translation_config.model)}</span>'
+            provider_status = f'<div class="translation-provider-status"><strong>{html.escape(provider_label)}</strong>{provider_detail}</div>'
+        disconnect_action = ""
+        if translation_config is not None:
+            disconnect_action = f'''<form method="post" action="/translation/disconnect"><input type="hidden" name="csrf" value="{token}"><input type="hidden" name="scope" value="settings"><button class="button" type="submit">解绑 API</button></form>'''
+        content = f'''<header class="settings-header"><div><h1>缓存、同步与翻译设置</h1><p class="account">缓存设置由网页与 CLI 共用；翻译配置和密钥保存在本机系统凭据库中。</p></div><a class="button" href="/">返回邮件列表</a></header>
 <section class="settings-shell">
   {status}
   <article class="settings-card"><h2>缓存策略</h2><p>邮件列表始终从本地缓存读取；body 和 memory 模式会在进入网页后按日期从新到旧后台缓存正文与正文图片，metadata 模式只保存邮件元数据。远程正文图片可能在邮件尚未打开时向发件方暴露公网 IP 和预取时间。</p>
@@ -2613,13 +3118,18 @@ class ViewerHandler(BaseHTTPRequestHandler):
       <div class="settings-actions"><button class="button primary" type="submit">保存设置</button></div>
     </form>
   </article>
-  <article class="settings-card danger-zone"><h2>清理缓存</h2><p>清除正文不会影响列表；重建全部缓存会暂时让列表为空，并在后台重新索引。</p>
+  <article class="settings-card" id="translation"><h2>中文翻译</h2><p>翻译只在你点击时执行，不会随正文预取自动调用。邮件主题和可见正文会发送给所选服务，账户信息、附件、图片、链接地址和邮箱密码不会发送。</p>
+    {provider_status}
+    <form class="translation-config-form" method="post" action="/translation/configure" data-translation-config-form><input type="hidden" name="csrf" value="{token}"><input type="hidden" name="scope" value="settings">{_translation_config_fields(translation_config)}<p class="translation-disclosure">DeepL 使用固定官方端点；OpenAI 兼容模式可用于 OpenAI、DeepSeek、通义或本机 Ollama。API 账号、额度与费用由你自行承担。</p><div class="settings-actions"><button class="button primary" type="submit">{ '更新 API 配置' if translation_config is not None else '绑定翻译 API' }</button></div></form>
+    <div class="settings-inline-actions">{disconnect_action}<form method="post" action="/translation/cache/clear"><input type="hidden" name="csrf" value="{token}"><input type="hidden" name="scope" value="settings"><button class="button" type="submit">只清除译文缓存</button></form></div>
+  </article>
+  <article class="settings-card danger-zone"><h2>清理缓存</h2><p>清除正文会同时清除图片和译文，但不会影响邮件列表；重建全部缓存会暂时让列表为空，并在后台重新索引。</p>
     <form class="inline-form" method="post" action="/settings"><input type="hidden" name="csrf" value="{token}"><input type="hidden" name="action" value="clear_bodies"><button class="button" type="submit">清除正文缓存</button></form>
     <form class="inline-form" method="post" action="/settings"><input type="hidden" name="csrf" value="{token}"><input type="hidden" name="action" value="clear_all"><button class="button danger" type="submit">重建全部缓存</button></form>
   </article>
   <article class="settings-card"><h2>本机位置</h2><p>{html.escape(str(runtime.cache_file))}</p></article>
 </section>'''
-        self._send(page("缓存与同步设置", content))
+        self._send(page("缓存、同步与翻译设置", content))
 
     def _settings_post(self, form: dict[str, list[str]]) -> None:
         runtime = self._runtime()

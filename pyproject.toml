@@ -33,4 +33,4 @@ classifiers = [
 qqmail-viewer = "qqmail_viewer:main"
 
 [tool.setuptools]
-py-modules = ["qqmail_viewer", "mail_cache", "mail_html", "mail_images", "mail_mime", "mail_sync"]
+py-modules = ["qqmail_viewer", "mail_cache", "mail_html", "mail_images", "mail_mime", "mail_sync", "mail_translation"]
