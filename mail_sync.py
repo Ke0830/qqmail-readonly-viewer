@@ -22,6 +22,7 @@ class _Job:
     limit: int = field(default=30, compare=False)
     uid: str = field(default="", compare=False)
     prefer_html: bool = field(default=False, compare=False)
+    image_resource: object = field(default=None, compare=False)
     event: threading.Event = field(default_factory=threading.Event, compare=False)
     result: object = field(default=None, compare=False)
     error: Exception | None = field(default=None, compare=False)
@@ -54,8 +55,12 @@ class _AccountWorker:
         limit: int = 30,
         uid: str = "",
         prefer_html: bool = False,
+        image_resource: object = None,
     ) -> _Job:
-        key = f"{kind}:{int(unread_only)}:{limit}:{uid}:{int(prefer_html)}"
+        resource_id = ""
+        if isinstance(image_resource, dict):
+            resource_id = str(image_resource.get("id", ""))
+        key = f"{kind}:{int(unread_only)}:{limit}:{uid}:{int(prefer_html)}:{resource_id}"
         with self._pending_lock:
             existing = self._pending.get(key)
             if existing is not None:
@@ -69,6 +74,7 @@ class _AccountWorker:
                 limit=limit,
                 uid=uid,
                 prefer_html=prefer_html,
+                image_resource=image_resource,
             )
             self._pending[key] = job
             self.jobs.put(job)
@@ -108,6 +114,10 @@ class _AccountWorker:
                         elif job.kind == "detail":
                             job.result = self._detail(
                                 client, job.uid, prefer_html=job.prefer_html
+                            )
+                        elif job.kind == "image":
+                            job.result = client.fetch_inline_image(
+                                job.uid, job.image_resource
                             )
                         else:
                             raise RuntimeError(f"unknown sync job: {job.kind}")
@@ -229,6 +239,7 @@ class _AccountWorker:
             safe_html=safe_html,
             blocked_images=blocked_images,
             html_policy=html_policy,
+            image_resources=getattr(detail, "image_resources", ()),
             cacheable=cacheable,
         )
         return detail
@@ -357,6 +368,28 @@ class SyncManager:
         )
         if not job.event.wait(timeout):
             raise TimeoutError("读取邮件正文超时。")
+        if job.error is not None:
+            raise job.error
+        return job.result
+
+    def fetch_image(
+        self,
+        account_name: str,
+        uid: str,
+        resource: object,
+        timeout: float = 30.0,
+    ):
+        worker = self.workers.get(account_name)
+        if worker is None:
+            raise RuntimeError(f"unknown account: {account_name}")
+        job = worker.submit(
+            "image",
+            priority=-9,
+            uid=uid,
+            image_resource=resource,
+        )
+        if not job.event.wait(timeout):
+            raise TimeoutError("读取邮件图片超时。")
         if job.error is not None:
             raise job.error
         return job.result

@@ -23,6 +23,7 @@ import subprocess
 import sys
 import threading
 import time
+import hashlib
 from dataclasses import asdict, dataclass
 from email.header import Header, decode_header
 from email.message import Message
@@ -33,7 +34,7 @@ from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Iterable
-from urllib.parse import parse_qs, urlencode, urlparse
+from urllib.parse import parse_qs, urlencode, urljoin, urlparse
 
 from mail_cache import (
     CACHE_MODES,
@@ -44,11 +45,19 @@ from mail_cache import (
 )
 from mail_html import (
     HTML_POLICY_VERSION,
+    HtmlImageReference,
     MAX_INPUT_BYTES,
     MAX_OUTPUT_BYTES,
     HtmlSanitizationError,
     normalize_plain_text,
+    materialize_image_placeholders,
     sanitize_email_html,
+)
+from mail_images import (
+    MAX_IMAGE_BYTES,
+    ImageValidationError,
+    RemoteImageFetcher,
+    validate_image,
 )
 from mail_mime import (
     BodyStructureError,
@@ -72,6 +81,8 @@ CACHE_KEY_SERVICE = "codex.qqmail-viewer.cache-encryption-key.v1"
 PROCESS_CSRF_TOKEN = secrets.token_urlsafe(32)
 DEFAULT_LIMIT = 30
 MAX_LIMIT = 100
+MAX_MESSAGE_IMAGE_COUNT = 30
+MAX_MESSAGE_IMAGE_BYTES = 30 * 1024 * 1024
 APP_TITLE = "本地邮箱查看器"
 CHINA_TIMEZONE = timezone(timedelta(hours=8))
 NETEASE_IMAP_HOSTS = frozenset({"imap.163.com", "imap.126.com", "imap.yeah.net"})
@@ -208,6 +219,7 @@ class MailDetail:
     body_format: str = "plain"
     blocked_images: int = 0
     html_policy: str = ""
+    image_resources: tuple[dict[str, object], ...] = ()
     cacheable: bool = True
 
 
@@ -931,6 +943,7 @@ class QQMailClient:
         body_format = "unavailable"
         blocked_images = 0
         html_policy = ""
+        image_resources: tuple[dict[str, object], ...] = ()
         cacheable = False
         try:
             structure_status, structure_rows = self._imap().uid(
@@ -943,10 +956,6 @@ class QQMailClient:
             )
             attachments = tuple(
                 decode_mime(name) or "未命名附件" for name in plan.attachments
-            )
-            inline_images = sum(
-                part.content_type.startswith("image/")
-                for part in plan.inline_resources
             )
             transport_error: ViewerError | None = None
             html_transport_failed = False
@@ -983,12 +992,19 @@ class QQMailClient:
                         decoded_parts.append(decoded)
 
                     if html_selected:
-                        sanitized = sanitize_email_html("\n".join(decoded_parts))
+                        selected_base = candidate[0].content_location if candidate else ""
+                        sanitized = sanitize_email_html(
+                            "\n".join(decoded_parts),
+                            content_location=selected_base,
+                        )
                         candidate_text = sanitized.plain_text
                         candidate_html = sanitized.safe_html.strip()
-                        candidate_blocked_images = max(
-                            sanitized.blocked_images, inline_images
+                        image_resources = _map_image_resources(
+                            sanitized.images,
+                            plan.inline_resources,
+                            selected_base,
                         )
+                        candidate_blocked_images = sanitized.blocked_images
                         if not candidate_html or (
                             not candidate_text
                             and "mail-image-placeholder" not in candidate_html
@@ -1041,6 +1057,7 @@ class QQMailClient:
                     body_format = "plain"
                     blocked_images = empty_blocked_images
                     html_policy = HTML_POLICY_VERSION if prefer_html else ""
+                    image_resources = ()
                     cacheable = True
                 elif plan.blocked_reason == "encrypted":
                     text = "这封邮件的正文已加密，当前无法安全读取"
@@ -1060,8 +1077,98 @@ class QQMailClient:
             body_format=body_format,
             blocked_images=blocked_images,
             html_policy=html_policy,
+            image_resources=image_resources,
             cacheable=cacheable,
         )
+
+    def fetch_inline_image(self, uid: str, resource: object):
+        """Read one approved inline image section through the account worker."""
+
+        if not isinstance(resource, dict):
+            raise ViewerError("图片资源无效。")
+        section = str(resource.get("section", ""))
+        content_type = str(resource.get("content_type", ""))
+        encoding = str(resource.get("encoding", ""))
+        octets = resource.get("octets")
+        if not section or not re.fullmatch(r"[0-9.]+", section):
+            raise ViewerError("图片 MIME section 无效。")
+        if not content_type.startswith("image/"):
+            raise ViewerError("该 MIME 资源不是图片。")
+        if isinstance(octets, int) and octets > MAX_IMAGE_BYTES * 2:
+            raise ViewerError("图片超过安全读取上限。")
+        fetch_section = f"BODY.PEEK[{section}]"
+        if octets is None:
+            fetch_section = f"BODY.PEEK[{section}]<0.{MAX_IMAGE_BYTES * 2 + 1}>"
+        status, rows = self._imap().uid("fetch", uid, f"({fetch_section})")
+        if status != "OK":
+            raise ViewerError("无法读取内嵌图片。")
+        raw_payload = extract_fetch_payload(rows)
+        if len(raw_payload) > MAX_IMAGE_BYTES * 2:
+            raise ViewerError("图片超过安全读取上限。")
+        payload = decode_transfer(raw_payload, encoding)
+        try:
+            return validate_image(payload, content_type)
+        except ImageValidationError as exc:
+            raise ViewerError("内嵌图片无法安全验证。") from exc
+
+
+def _map_image_resources(
+    references: Iterable[HtmlImageReference],
+    inline_parts: Iterable[object],
+    content_location: str = "",
+) -> tuple[dict[str, object], ...]:
+    parts = tuple(inline_parts)
+    resources: list[dict[str, object]] = []
+    for reference in references:
+        source_type = reference.source_type
+        source = reference.source
+        matched = None
+        if source_type == "cid":
+            wanted = source.strip().strip("<>").casefold()
+            matched = next(
+                (
+                    part
+                    for part in parts
+                    if str(getattr(part, "content_type", "")).startswith("image/")
+                    and str(getattr(part, "content_id", "")).strip().strip("<>").casefold()
+                    == wanted
+                ),
+                None,
+            )
+            if matched is None:
+                continue
+        elif source_type in {"location", "remote"}:
+            matched = next(
+                (
+                    part
+                    for part in parts
+                    if str(getattr(part, "content_type", "")).startswith("image/")
+                    and str(getattr(part, "content_location", "")).strip() == source
+                ),
+                None,
+            )
+            if matched is not None:
+                # A Content-Location reference is an inline MIME resource,
+                # even when its identifier looks like an HTTP URL.
+                source_type = "cid"
+            elif source_type == "location":
+                if not content_location or not re.match(r"https?://", content_location, re.I):
+                    continue
+                source_type = "remote"
+                source = urljoin(content_location, source)
+        resource: dict[str, object] = {
+            "id": reference.resource_id,
+            "source_type": source_type,
+            "source": source,
+            "descriptor": reference.descriptor,
+            "section": str(getattr(matched, "section", "")) if matched else "",
+            "content_type": str(getattr(matched, "content_type", "")) if matched else "",
+            "encoding": str(getattr(matched, "encoding", "")) if matched else "",
+            "octets": getattr(matched, "octets", None) if matched else None,
+        }
+        if len(resources) < MAX_MESSAGE_IMAGE_COUNT:
+            resources.append(resource)
+    return tuple(resources)
 
 
 def _internaldate_timestamp(metadata: bytes) -> float | None:
@@ -1192,6 +1299,46 @@ def configured_client_for(account: Account, secret: str) -> QQMailClient:
     return QQMailClient(account.email, secret, host=account.host, port=account.port, provider_label=account.provider_label)
 
 
+class _ImageTokenStore:
+    def __init__(self, ttl_seconds: float = 3600.0) -> None:
+        self.ttl_seconds = ttl_seconds
+        self._items: dict[str, tuple[float, str, str, dict[str, object]]] = {}
+        self._lock = threading.RLock()
+
+    def register(
+        self, account_name: str, uid: str, resource: dict[str, object]
+    ) -> str:
+        token = secrets.token_urlsafe(32)
+        with self._lock:
+            self._purge_locked()
+            self._items[token] = (
+                time.time() + self.ttl_seconds,
+                account_name,
+                str(uid),
+                dict(resource),
+            )
+        return token
+
+    def resolve(self, token: str) -> tuple[str, str, dict[str, object]] | None:
+        with self._lock:
+            self._purge_locked()
+            item = self._items.get(token)
+            if item is None:
+                return None
+            _expires, account_name, uid, resource = item
+            return account_name, uid, dict(resource)
+
+    def clear(self) -> None:
+        with self._lock:
+            self._items.clear()
+
+    def _purge_locked(self) -> None:
+        now = time.time()
+        expired = [token for token, item in self._items.items() if item[0] <= now]
+        for token in expired:
+            self._items.pop(token, None)
+
+
 class ViewerRuntime:
     """Shared cache and per-account workers for one CLI command or web server."""
 
@@ -1216,6 +1363,9 @@ class ViewerRuntime:
             self.encryption_key, key_created = encryption_key, False
         self._lock = threading.RLock()
         self.cache = CacheStore(self.cache_file, self.settings, self.encryption_key)
+        self.image_tokens = _ImageTokenStore()
+        self.remote_images = RemoteImageFetcher()
+        self._image_budget_lock = threading.RLock()
         if key_created and self.settings.cache_mode != "memory":
             self.cache.clear_bodies()
         self.sync = SyncManager(
@@ -1229,7 +1379,74 @@ class ViewerRuntime:
     def close(self) -> None:
         with self._lock:
             self.sync.stop()
+            self.image_tokens.clear()
             self.cache.close()
+
+    def materialize_html(self, account_name: str, uid: str, item: MailDetail) -> str:
+        if not item.safe_html or not item.image_resources:
+            return item.safe_html
+        urls: dict[str, object] = {}
+        for resource in item.image_resources:
+            resource_id = str(resource.get("id", ""))
+            if not resource_id:
+                continue
+            token = self.image_tokens.register(account_name, uid, resource)
+            value: object = f"/message-image/{token}"
+            descriptor = str(resource.get("descriptor", ""))
+            urls[resource_id] = (value, descriptor)
+        return materialize_image_placeholders(item.safe_html, urls)
+
+    def image_for_token(self, token: str):
+        resolved = self.image_tokens.resolve(token)
+        if resolved is None:
+            raise ViewerError("图片资源已过期，请重新打开邮件。")
+        account_name, uid, resource = resolved
+        resource_id = str(resource.get("id", ""))
+        source = str(resource.get("source", ""))
+        source_digest = hashlib.sha256(
+            json.dumps(resource, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode("utf-8")
+        ).hexdigest()
+        cached = self.cache.load_image(
+            account_name, uid, resource_id, source_digest=source_digest
+        )
+        if cached is not None:
+            return cached.mime_type, cached.data
+        source_type = str(resource.get("source_type", ""))
+        if source_type == "cid":
+            image = self.sync.fetch_image(account_name, uid, resource)
+        elif source_type == "remote":
+            image = self.remote_images.fetch(source)
+        elif source_type == "data":
+            match = re.fullmatch(
+                r"data:image/(?:png|jpeg|gif|webp);base64,([A-Za-z0-9+/=\s]+)",
+                source,
+                re.IGNORECASE,
+            )
+            if match is None:
+                raise ViewerError("图片 data URI 无效。")
+            try:
+                payload = base64.b64decode(
+                    re.sub(r"\s+", "", match.group(1)), validate=True
+                )
+                image = validate_image(payload, source[5:].split(";", 1)[0])
+            except (ValueError, ImageValidationError) as exc:
+                raise ViewerError("图片无法安全验证。") from exc
+        else:
+            raise ViewerError("图片来源无法安全解析。")
+        with self._image_budget_lock:
+            current_bytes = self.cache.image_bytes_for_message(account_name, uid)
+            if current_bytes + len(image.data) > MAX_MESSAGE_IMAGE_BYTES:
+                raise ViewerError("本邮件图片总量超过安全上限。")
+            self.cache.store_image(
+                account_name,
+                uid,
+                resource_id,
+                mime_type=image.mime_type,
+                source_type=source_type,
+                source_digest=source_digest,
+                data=image.data,
+            )
+        return image.mime_type, image.data
 
     def reconfigure(
         self,
@@ -1254,6 +1471,7 @@ class ViewerRuntime:
                 else:
                     self.cache.clear_all()
             self.cache.close()
+            self.image_tokens.clear()
             save_settings(requested)
             self.settings = requested
             self.cache = CacheStore(
@@ -1308,6 +1526,9 @@ class ViewerRuntime:
                 ),
                 html_policy=(
                     cached.html_policy if cached_web_body_is_current else ""
+                ),
+                image_resources=(
+                    cached.image_resources if cached_web_body_is_current else ()
                 ),
             )
         fetched: MailDetail | None = None
@@ -1485,13 +1706,13 @@ def aggregate_cli(
 
 MAIL_BODY_CSP = (
     "default-src 'none'; script-src 'none'; connect-src 'none'; "
-    "img-src 'none'; font-src 'none'; media-src 'none'; object-src 'none'; "
+    "img-src 'self'; font-src 'none'; media-src 'none'; object-src 'none'; "
     "frame-src 'none'; style-src 'unsafe-inline'; base-uri 'none'; "
     "form-action 'none'"
 )
 
 MAIL_BODY_STYLE = """
-:root{color-scheme:light}*{box-sizing:border-box}html{min-width:0;background:#fff;overflow-x:hidden;overflow-y:hidden}body{min-width:0;margin:0;padding:28px;background:#fff;color:#242424;font:15px/1.65 -apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;overflow-x:auto;overflow-y:hidden;overflow-wrap:anywhere}table{max-width:none}td,th{overflow-wrap:break-word}pre{white-space:pre-wrap;overflow-wrap:anywhere}a{color:#282828;font-weight:650;text-decoration:underline;text-underline-offset:2px;overflow-wrap:anywhere}.mail-image-placeholder{display:inline-flex;align-items:center;justify-content:center;min-width:120px;min-height:52px;max-width:100%;margin:4px 0;padding:10px 14px;border:1px dashed #b8b8b8;border-radius:8px;background:#f5f5f5;color:#6b6b6b;font:13px/1.45 -apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;text-align:center;vertical-align:middle}@media(max-width:600px){body{padding:18px 16px;font-size:16px}}
+:root{color-scheme:light}*{box-sizing:border-box}html{min-width:0;background:#fff;overflow-x:hidden;overflow-y:hidden}body{min-width:0;margin:0;padding:28px;background:#fff;color:#242424;font:15px/1.65 -apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;overflow-x:auto;overflow-y:hidden;overflow-wrap:anywhere}table{max-width:none}td,th{overflow-wrap:break-word}pre{white-space:pre-wrap;overflow-wrap:anywhere}a{color:#282828;font-weight:650;text-decoration:underline;text-underline-offset:2px;overflow-wrap:anywhere}.mail-image{display:inline-block;max-width:100%;height:auto;margin:4px 0;vertical-align:middle}.mail-image-placeholder{display:inline-flex;align-items:center;justify-content:center;min-width:120px;min-height:52px;max-width:100%;margin:4px 0;padding:10px 14px;border:1px dashed #b8b8b8;border-radius:8px;background:#f5f5f5;color:#6b6b6b;font:13px/1.45 -apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;text-align:center;vertical-align:middle}@media(max-width:600px){body{padding:18px 16px;font-size:16px}}
 """.strip()
 
 
@@ -1522,6 +1743,7 @@ BASE_SCRIPT = """
   const reducedMotion = window.matchMedia("(prefers-reduced-motion: reduce)");
   let navigating = false;
   const wiredFrameDocuments = new WeakSet();
+  const frameResizeObservers = new WeakMap();
 
   const fetchPage = async (url) => {
     const response = await window.fetch(url, {
@@ -1641,6 +1863,49 @@ BASE_SCRIPT = """
     dialog.showModal();
   };
 
+  const wireFrameImages = (shell, frame, frameDocument) => {
+    const status = shell.querySelector("[data-image-status]");
+    const images = Array.from(frameDocument.images);
+    if (!images.length || !status) return;
+    let settled = 0;
+    let failed = 0;
+    const seen = new WeakSet();
+    const update = () => {
+      const total = images.length;
+      if (settled < total) {
+        status.textContent = `正在加载 ${settled} / ${total} 张图片`;
+      } else if (failed) {
+        status.textContent = `${total - failed} 张图片已加载，${failed} 张无法安全加载`;
+      } else {
+        status.textContent = `${total} 张图片已加载`;
+      }
+      resizeMessageFrame(frame);
+    };
+    const settle = (image, didFail) => {
+      if (seen.has(image)) return;
+      seen.add(image);
+      settled += 1;
+      if (didFail) {
+        failed += 1;
+        const placeholder = frameDocument.createElement("span");
+        placeholder.className = "mail-image-placeholder";
+        placeholder.setAttribute("role", "img");
+        placeholder.setAttribute("aria-label", image.alt || "图片未加载");
+        placeholder.textContent = image.alt || "图片未加载";
+        image.replaceWith(placeholder);
+      }
+      update();
+    };
+    images.forEach((image) => {
+      image.addEventListener("load", () => settle(image, false), {once: true});
+      image.addEventListener("error", () => settle(image, true), {once: true});
+      if (image.complete) {
+        window.setTimeout(() => settle(image, image.naturalWidth === 0), 0);
+      }
+    });
+    update();
+  };
+
   const initializeMessageBodies = () => {
     document.querySelectorAll("[data-message-body]").forEach((shell) => {
       if (!(shell instanceof HTMLElement) || shell.dataset.initialized === "true") return;
@@ -1673,6 +1938,13 @@ BASE_SCRIPT = """
             const frameDocument = frame.contentDocument;
             if (!frameDocument || wiredFrameDocuments.has(frameDocument)) return;
             wiredFrameDocuments.add(frameDocument);
+            if (typeof ResizeObserver !== "undefined") {
+              const observer = new ResizeObserver(() => resizeMessageFrame(frame));
+              if (frameDocument.documentElement) observer.observe(frameDocument.documentElement);
+              if (frameDocument.body) observer.observe(frameDocument.body);
+              frameResizeObservers.set(frame, observer);
+            }
+            wireFrameImages(shell, frame, frameDocument);
             frameDocument.addEventListener("click", (event) => {
               const eventTarget = event.target;
               if (!eventTarget || eventTarget.nodeType !== 1) return;
@@ -1831,6 +2103,8 @@ class ViewerHandler(BaseHTTPRequestHandler):
                 self._home(query)
             elif route.path == "/message":
                 self._message(query)
+            elif route.path.startswith("/message-image/"):
+                self._message_image(route.path.removeprefix("/message-image/"))
             elif route.path == "/api/messages":
                 self._api_messages(query)
             elif route.path == "/settings":
@@ -2182,10 +2456,22 @@ class ViewerHandler(BaseHTTPRequestHandler):
             and item.safe_html
             and item.html_policy == HTML_POLICY_VERSION
         )
+        materialize_html = getattr(runtime, "materialize_html", None)
+        rendered_html = (
+            materialize_html(account.name, uid, item)
+            if has_rich_body and callable(materialize_html)
+            else (item.safe_html if has_rich_body else "")
+        )
+        image_count = len(item.image_resources)
+        hidden_images = max(0, item.blocked_images - image_count)
         image_notice = (
-            f'<p class="body-image-notice" role="note">本邮件中的 {item.blocked_images} 张图片已隐藏</p>'
-            if item.blocked_images > 0
-            else ""
+            f'<p class="body-image-notice" role="status" data-image-status data-image-total="{image_count}">正在自动加载 {image_count} 张图片</p>'
+            if image_count
+            else (
+                f'<p class="body-image-notice" role="note">本邮件中的 {hidden_images} 张图片无法安全加载</p>'
+                if hidden_images > 0
+                else ""
+            )
         )
         if has_rich_body:
             body_toolbar = f'''<div class="message-body-toolbar">
@@ -2193,7 +2479,7 @@ class ViewerHandler(BaseHTTPRequestHandler):
   {image_notice}
 </div>'''
             body_content = f'''{body_toolbar}
-<section class="body-panel" data-body-panel="html" aria-label="排版版正文"><iframe class="message-body-frame" title="邮件排版正文" sandbox="allow-same-origin" referrerpolicy="no-referrer" srcdoc="{_mail_body_srcdoc(item.safe_html)}"></iframe></section>
+<section class="body-panel" data-body-panel="html" aria-label="排版版正文"><iframe class="message-body-frame" title="邮件排版正文" sandbox="allow-same-origin" referrerpolicy="no-referrer" srcdoc="{_mail_body_srcdoc(rendered_html)}"></iframe></section>
 <section class="body-panel" data-body-panel="plain" aria-label="纯文本正文" hidden><div class="body">{plain_body}</div></section>
 <dialog class="external-link-dialog" data-external-link-dialog aria-labelledby="external-link-title">
   <div class="external-link-content"><h2 id="external-link-title">打开外部链接？</h2><p>这个地址将离开本地邮箱查看器。请确认完整地址后再继续。</p><output class="external-link-url" data-external-link-url></output><div class="external-link-actions"><form method="dialog"><button class="button" type="submit" value="cancel">取消</button></form><button class="button primary" type="button" data-open-external-link>确认打开</button></div></div>
@@ -2294,10 +2580,12 @@ class ViewerHandler(BaseHTTPRequestHandler):
         action = form.get("action", [""])[0]
         if action == "clear_bodies":
             runtime.cache.clear_bodies()
+            runtime.image_tokens.clear()
             self._redirect("/settings?cleared=bodies")
             return
         if action == "clear_all":
             runtime.cache.clear_all()
+            runtime.image_tokens.clear()
             runtime.sync.kick_background(DEFAULT_LIMIT)
             self._redirect("/settings?cleared=all")
             return
@@ -2324,6 +2612,31 @@ class ViewerHandler(BaseHTTPRequestHandler):
 </article></section>'''
         self._send(page("处理现有缓存", content))
 
+    def _message_image(self, token: str) -> None:
+        if not re.fullmatch(r"[A-Za-z0-9_-]{20,128}", token):
+            self._send_image_error(HTTPStatus.NOT_FOUND)
+            return
+        try:
+            mime_type, data = self._runtime().image_for_token(token)
+        except (ViewerError, TimeoutError, ValueError):
+            self._send_image_error(HTTPStatus.NOT_FOUND)
+            return
+        self.send_response(HTTPStatus.OK)
+        self.send_header("Content-Type", mime_type)
+        self.send_header("Content-Length", str(len(data)))
+        self.send_header("Cache-Control", "private, max-age=3600")
+        self.send_header("X-Content-Type-Options", "nosniff")
+        self.send_header("Referrer-Policy", "no-referrer")
+        self.end_headers()
+        self.wfile.write(data)
+
+    def _send_image_error(self, status: HTTPStatus) -> None:
+        self.send_response(status)
+        self.send_header("Content-Length", "0")
+        self.send_header("Cache-Control", "no-store")
+        self.send_header("X-Content-Type-Options", "nosniff")
+        self.end_headers()
+
     def _redirect(self, location: str) -> None:
         self.send_response(HTTPStatus.SEE_OTHER)
         self.send_header("Location", location)
@@ -2339,7 +2652,7 @@ class ViewerHandler(BaseHTTPRequestHandler):
         self.send_header("X-Content-Type-Options", "nosniff")
         self.send_header("X-Frame-Options", "DENY")
         self.send_header("Referrer-Policy", "no-referrer")
-        self.send_header("Content-Security-Policy", "default-src 'none'; script-src 'self'; connect-src 'self'; frame-src 'self'; style-src 'unsafe-inline'; base-uri 'none'; frame-ancestors 'none'")
+        self.send_header("Content-Security-Policy", "default-src 'none'; script-src 'self'; connect-src 'self'; img-src 'self'; frame-src 'self'; style-src 'unsafe-inline'; base-uri 'none'; frame-ancestors 'none'")
         self.end_headers()
         self.wfile.write(body)
 

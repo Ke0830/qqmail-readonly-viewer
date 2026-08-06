@@ -102,7 +102,7 @@ class RichTextRenderingTests(unittest.TestCase):
         self.assertIn(safe_html, decoded_srcdoc)
         self.assertIn('http-equiv="Content-Security-Policy"', decoded_srcdoc)
         self.assertIn("default-src 'none'", decoded_srcdoc)
-        self.assertIn("img-src 'none'", decoded_srcdoc)
+        self.assertIn("img-src 'self'", decoded_srcdoc)
         self.assertIn("font-src 'none'", decoded_srcdoc)
         self.assertIn("form-action 'none'", decoded_srcdoc)
         self.assertNotIn(safe_html, rendered)
@@ -126,7 +126,7 @@ class RichTextRenderingTests(unittest.TestCase):
         }
         self.assertNotIn("hidden", panels["html"])
         self.assertIn("hidden", panels["plain"])
-        self.assertIn("本邮件中的 2 张图片已隐藏", rendered)
+        self.assertIn("本邮件中的 2 张图片无法安全加载", rendered)
         self.assertIn('data-external-link-dialog', rendered)
         self.assertIn('data-open-external-link', rendered)
         self.assertIn("排版正文", rendered)
@@ -158,7 +158,7 @@ class RichTextRenderingTests(unittest.TestCase):
         for directive in (
             "script-src 'none'",
             "connect-src 'none'",
-            "img-src 'none'",
+            "img-src 'self'",
             "font-src 'none'",
             "media-src 'none'",
             "object-src 'none'",
@@ -175,7 +175,7 @@ class RichTextRenderingTests(unittest.TestCase):
         self.assertIn("overflow-y:hidden", MAIL_BODY_STYLE)
         self.assertNotIn("overflow:auto", MAIL_BODY_STYLE)
 
-    def test_parent_page_csp_allows_only_local_frames(self):
+    def test_parent_page_csp_allows_only_local_frames_and_images(self):
         handler = object.__new__(ViewerHandler)
         handler.send_response = MagicMock()
         handler.send_header = MagicMock()
@@ -190,8 +190,11 @@ class RichTextRenderingTests(unittest.TestCase):
         }
         policy = headers["Content-Security-Policy"]
         self.assertIn("frame-src 'self'", policy)
+        self.assertIn("img-src 'self'", policy)
         self.assertNotIn("frame-src http:", policy)
         self.assertNotIn("frame-src https:", policy)
+        self.assertNotIn("img-src http:", policy)
+        self.assertNotIn("img-src https:", policy)
 
     def test_external_links_are_intercepted_and_opened_only_after_confirmation(self):
         self.assertIn("confirmExternalLink(shell, destination)", BASE_SCRIPT)

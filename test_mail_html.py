@@ -6,6 +6,7 @@ from mail_html import (
     HTML_POLICY_VERSION,
     HtmlSizeLimitError,
     SanitizedEmailHtml,
+    materialize_image_placeholders,
     normalize_plain_text,
     sanitize_email_html,
 )
@@ -25,7 +26,7 @@ class MailHtmlTests(unittest.TestCase):
             """
         )
         self.assertIsInstance(result, SanitizedEmailHtml)
-        self.assertEqual(HTML_POLICY_VERSION, "mail-html-v1")
+        self.assertEqual(HTML_POLICY_VERSION, "mail-html-v2")
         self.assertIn("<main>", result.safe_html)
         self.assertIn("<table", result.safe_html)
         self.assertIn('width="640"', result.safe_html)
@@ -178,6 +179,34 @@ class MailHtmlTests(unittest.TestCase):
         self.assertNotIn("cid:", result.safe_html)
         self.assertNotIn("data:image", result.safe_html)
         self.assertNotIn("hidden", result.safe_html)
+
+    def test_keeps_image_sources_only_in_the_resource_manifest(self):
+        result = sanitize_email_html(
+            '<img src="cid:hero@message" alt="横幅">'
+            '<img src="https://images.example/logo.png" '
+            'srcset="https://images.example/logo@2x.png 2x">'
+        )
+        self.assertEqual(
+            [(item.source_type, item.source, item.descriptor) for item in result.images],
+            [
+                ("cid", "hero@message", ""),
+                ("remote", "https://images.example/logo.png", ""),
+                ("remote", "https://images.example/logo@2x.png", "2x"),
+            ],
+        )
+        self.assertNotIn("images.example", result.safe_html)
+        self.assertNotIn("cid:hero", result.safe_html)
+        rendered = materialize_image_placeholders(
+            result.safe_html,
+            {
+                "r1": ("/message-image/cid-token", ""),
+                "r2": ("/message-image/remote-token", ""),
+                "r3": ("/message-image/remote-2x-token", "2x"),
+            },
+        )
+        self.assertIn('src="/message-image/cid-token"', rendered)
+        self.assertIn('srcset="/message-image/remote-2x-token 2x"', rendered)
+        self.assertNotIn("images.example", rendered)
 
     def test_strips_svg_math_and_malformed_script_payloads(self):
         result = sanitize_email_html(

@@ -1,3 +1,4 @@
+import base64
 import io
 import json
 import os
@@ -8,6 +9,8 @@ import unittest
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
+
+from PIL import Image
 
 import mail_cache
 from mail_cache import (
@@ -232,6 +235,100 @@ class CacheStoreTests(unittest.TestCase):
                 reopened.connection.execute("SELECT body_ciphertext FROM messages").fetchone()[0]
             )
             reopened.close()
+
+    @unittest.skipIf(mail_cache.AESGCM is None, "cryptography is not installed")
+    def test_image_cache_is_encrypted_persistent_and_cleared_with_bodies(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "mail.sqlite3"
+            key = bytes(range(32))
+            cache = CacheStore(path, CacheSettings("body", 3), key)
+            cache.upsert_messages("a", [_summary("1")])
+            cache.store_image(
+                "a",
+                "1",
+                "r1",
+                mime_type="image/png",
+                source_type="cid",
+                source_digest="a" * 64,
+                data=b"private-image-bytes",
+            )
+            row = cache.connection.execute(
+                "SELECT image_ciphertext FROM message_images"
+            ).fetchone()
+            self.assertNotIn(b"private-image-bytes", bytes(row[0]))
+            cache.close()
+
+            reopened = CacheStore(path, CacheSettings("body", 3), key)
+            image = reopened.load_image("a", "1", "r1", source_digest="a" * 64)
+            self.assertIsNotNone(image)
+            self.assertEqual(image.data, b"private-image-bytes")
+            reopened.clear_bodies()
+            self.assertIsNone(reopened.load_image("a", "1", "r1"))
+            self.assertEqual(reopened.image_bytes_for_message("a", "1"), 0)
+            reopened.close()
+
+    def test_runtime_materializes_only_local_image_tokens_and_caches_data_images(self):
+        with tempfile.TemporaryDirectory() as directory:
+            account = Account(
+                "a",
+                "qq",
+                "reader@example.com",
+                "imap.qq.com",
+                993,
+                "service.email",
+                "service.secret",
+                True,
+            )
+            runtime = ViewerRuntime(
+                periodic=False,
+                accounts=(account,),
+                settings=CacheSettings("memory", 3),
+                cache_file=Path(directory) / "mail.sqlite3",
+                encryption_key=b"z" * 32,
+            )
+            try:
+                runtime.cache.upsert_messages("a", [_summary("1")])
+                output = io.BytesIO()
+                Image.new("RGB", (2, 1), (1, 2, 3)).save(output, format="PNG")
+                source = "data:image/png;base64," + base64.b64encode(
+                    output.getvalue()
+                ).decode("ascii")
+                detail = mail_cache.CachedDetail(
+                    runtime.cache.message("a", "1"),
+                    "body",
+                    (),
+                    body_format="html",
+                    safe_html='<span class="mail-image-placeholder" data-mail-image-ids="r1">图片未加载</span>',
+                    image_resources=(
+                        {
+                            "id": "r1",
+                            "source_type": "data",
+                            "source": source,
+                            "descriptor": "",
+                            "section": "",
+                            "content_type": "",
+                            "encoding": "",
+                            "octets": None,
+                        },
+                    ),
+                )
+                rendered = runtime.materialize_html(
+                    "a",
+                    "1",
+                    SimpleNamespace(
+                        safe_html=detail.safe_html,
+                        image_resources=detail.image_resources,
+                    ),
+                )
+                self.assertIn('/message-image/', rendered)
+                self.assertNotIn(source, rendered)
+                token = rendered.split('/message-image/', 1)[1].split('"', 1)[0]
+                mime_type, image = runtime.image_for_token(token)
+                self.assertEqual(mime_type, "image/png")
+                self.assertEqual(image, output.getvalue())
+                self.assertEqual(runtime.cache.image_bytes_for_message("a", "1"), len(image))
+            finally:
+                runtime.close()
 
     @unittest.skipIf(mail_cache.AESGCM is None, "cryptography is not installed")
     def test_legacy_plaintext_ciphertext_is_read_as_v1_cache(self):

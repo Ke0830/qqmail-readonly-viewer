@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import base64
 import html
 import io
 import ipaddress
@@ -10,6 +11,7 @@ import re
 import unicodedata
 from dataclasses import dataclass
 from html.parser import HTMLParser
+from typing import Mapping
 from urllib.parse import urlsplit
 
 import nh3
@@ -18,7 +20,7 @@ import tinycss2
 
 MAX_INPUT_BYTES = 5 * 1024 * 1024
 MAX_OUTPUT_BYTES = 2 * 1024 * 1024
-HTML_POLICY_VERSION = "mail-html-v1"
+HTML_POLICY_VERSION = "mail-html-v2"
 
 
 class HtmlSanitizationError(ValueError):
@@ -34,6 +36,22 @@ class SanitizedEmailHtml:
     safe_html: str
     plain_text: str
     blocked_images: int
+    images: tuple["HtmlImageReference", ...] = ()
+
+
+@dataclass(frozen=True)
+class HtmlImageReference:
+    """An image source kept outside the inert HTML document.
+
+    ``safe_html`` only contains the opaque ``resource_id``.  The source is
+    retained for the caller to resolve against MIME resources or the local
+    image proxy, then is encrypted together with the body cache.
+    """
+
+    resource_id: str
+    source_type: str
+    source: str
+    descriptor: str = ""
 
 
 _ALLOWED_TAGS = {
@@ -121,7 +139,7 @@ _TAG_ATTRIBUTES = {
     "colgroup": {"align", "span", "valign", "width"},
     "font": {"color", "face", "size"},
     "hr": {"align", "color", "size", "width"},
-    "img": {"alt", "height", "style", "title", "width"},
+    "img": {"alt", "height", "src", "srcset", "style", "title", "width"},
     "li": {"value"},
     "ol": {"start", "type"},
     "table": {
@@ -302,7 +320,9 @@ _UNSAFE_HOSTNAME_CODEPOINT_RANGES = (
 )
 
 
-def sanitize_email_html(raw_html: str) -> SanitizedEmailHtml:
+def sanitize_email_html(
+    raw_html: str, *, content_location: str = ""
+) -> SanitizedEmailHtml:
     """Return inert HTML plus a normalized text fallback.
 
     The result contains no automatically fetched resource URLs. The only URL
@@ -331,7 +351,10 @@ def sanitize_email_html(raw_html: str) -> SanitizedEmailHtml:
             clean_content_tags=_CLEAN_CONTENT_TAGS,
             attributes=_ALLOWED_ATTRIBUTES,
             attribute_filter=_filter_attribute,
-            url_schemes={"http", "https"},
+            # Image URLs are removed by _ImageFilter below.  These schemes are
+            # only permitted long enough to turn them into opaque IDs; they are
+            # never emitted in the returned HTML.
+            url_schemes={"cid", "data", "http", "https"},
             strip_comments=True,
         )
     except Exception as exc:
@@ -354,7 +377,12 @@ def sanitize_email_html(raw_html: str) -> SanitizedEmailHtml:
         raise HtmlSizeLimitError(
             f"plain-text output exceeds {MAX_OUTPUT_BYTES} bytes"
         )
-    return SanitizedEmailHtml(safe_html, plain_text, image_filter.blocked_images)
+    return SanitizedEmailHtml(
+        safe_html,
+        plain_text,
+        image_filter.blocked_images,
+        tuple(image_filter.images),
+    )
 
 
 def normalize_plain_text(value: str) -> str:
@@ -385,6 +413,11 @@ def _filter_attribute(tag: str, attribute: str, value: str) -> str | None:
         return _sanitize_style(value)
     if attribute == "href":
         return _safe_http_url(value) if tag == "a" else None
+    if tag == "img" and attribute in {"src", "srcset"}:
+        # The second parser pass classifies and removes this value.  Keeping
+        # the raw candidate here lets CID and data images be mapped to an
+        # opaque local resource without ever rendering their original URL.
+        return _transient_image_attribute(value)
     if attribute == "dir":
         normalized = value.strip().lower()
         return normalized if normalized in {"auto", "ltr", "rtl"} else None
@@ -413,6 +446,15 @@ def _filter_attribute(tag: str, attribute: str, value: str) -> str | None:
     if attribute in {"bgcolor", "color"}:
         return _safe_color(value)
     return None
+
+
+def _transient_image_attribute(value: str) -> str | None:
+    normalized = "".join(
+        character for character in value.strip() if ord(character) >= 0x20
+    )
+    if not normalized or len(normalized) > 16_384 or "\\" in normalized:
+        return None
+    return normalized
 
 
 def _safe_http_url(value: str) -> str | None:
@@ -666,6 +708,8 @@ class _ImageFilter(HTMLParser):
         self.parts = io.StringIO()
         self.output_bytes = 0
         self.blocked_images = 0
+        self.images: list[HtmlImageReference] = []
+        self._resource_ids: dict[tuple[str, str, str], str] = {}
 
     def handle_starttag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
         self._start(tag, attrs, self_closing=tag in _VOID_TAGS)
@@ -713,8 +757,24 @@ class _ImageFilter(HTMLParser):
             label = "图片未加载" + (f"：{alt}" if alt else "")
             escaped = html.escape(label)
             aria = html.escape(label, quote=True)
+            ids = self._image_resource_ids(attributes)
+            data_attributes = (
+                f' data-mail-image-ids="{html.escape(",".join(ids), quote=True)}"'
+                if ids
+                else ""
+            )
+            for attribute, data_name in (
+                ("width", "width"),
+                ("height", "height"),
+                ("style", "style"),
+            ):
+                value = attributes.get(attribute, "")
+                if value:
+                    data_attributes += (
+                        f' data-mail-image-{data_name}="{html.escape(value, quote=True)}"'
+                    )
             self._append(
-                f'<span class="mail-image-placeholder" role="img" aria-label="{aria}">{escaped}</span>'
+                f'<span class="mail-image-placeholder" role="img" aria-label="{aria}"{data_attributes}>{escaped}</span>'
             )
             return
         if tag == "a":
@@ -741,6 +801,236 @@ class _ImageFilter(HTMLParser):
             self._append(f"<{tag}{serialized_attrs}></{tag}>")
         else:
             self._append(f"<{tag}{serialized_attrs}>")
+
+    def _image_resource_ids(self, attributes: dict[str, str]) -> tuple[str, ...]:
+        candidates: list[tuple[str, str]] = []
+        source = attributes.get("src", "")
+        if source:
+            candidates.append((source, ""))
+        candidates.extend(_parse_srcset(attributes.get("srcset", "")))
+        result: list[str] = []
+        for value, descriptor in candidates:
+            classified = _classify_image_source(value)
+            if classified is None:
+                continue
+            source_type, normalized = classified
+            key = (source_type, normalized, descriptor)
+            resource_id = self._resource_ids.get(key)
+            if resource_id is None:
+                resource_id = f"r{len(self._resource_ids) + 1}"
+                self._resource_ids[key] = resource_id
+                self.images.append(
+                    HtmlImageReference(
+                        resource_id=resource_id,
+                        source_type=source_type,
+                        source=normalized,
+                        descriptor=descriptor,
+                    )
+                )
+            if resource_id not in result:
+                result.append(resource_id)
+        return tuple(result)
+
+
+class _ImageMaterializer(HTMLParser):
+    def __init__(self, resource_urls: Mapping[str, object]) -> None:
+        super().__init__(convert_charrefs=False)
+        self.resource_urls = resource_urls
+        self.parts = io.StringIO()
+        self.skip_depth = 0
+
+    def handle_starttag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
+        if self.skip_depth:
+            self.skip_depth += 1
+            return
+        attributes = {name: value or "" for name, value in attrs}
+        classes = set(attributes.get("class", "").split())
+        if tag == "span" and "mail-image-placeholder" in classes:
+            ids = tuple(
+                item for item in attributes.get("data-mail-image-ids", "").split(",")
+                if item
+            )
+            candidates = [
+                _materialized_image_candidate(self.resource_urls.get(item))
+                for item in ids
+            ]
+            candidates = [item for item in candidates if item is not None]
+            if candidates:
+                first_url, _first_descriptor = candidates[0]
+                image_attrs = [
+                    ("class", "mail-image"),
+                    ("src", first_url),
+                    ("alt", attributes.get("aria-label", "图片")),
+                    ("referrerpolicy", "no-referrer"),
+                    ("decoding", "async"),
+                ]
+                descriptors = [
+                    (url, descriptor)
+                    for url, descriptor in candidates
+                    if descriptor
+                ]
+                if descriptors:
+                    image_attrs.append(
+                        ("srcset", ", ".join(f"{url} {descriptor}" for url, descriptor in descriptors))
+                    )
+                for name in ("width", "height", "style"):
+                    value = attributes.get(f"data-mail-image-{name}", "")
+                    if value:
+                        image_attrs.append((name, value))
+                self.parts.write(
+                    "<img"
+                    + "".join(
+                        f' {name}="{html.escape(value, quote=True)}"'
+                        for name, value in image_attrs
+                    )
+                    + ">"
+                )
+                self.skip_depth = 1
+                return
+        self._write_tag(tag, attrs)
+
+    def handle_startendtag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
+        self.handle_starttag(tag, attrs)
+
+    def handle_endtag(self, tag: str) -> None:
+        if self.skip_depth:
+            self.skip_depth -= 1
+            return
+        if tag not in _VOID_TAGS:
+            self.parts.write(f"</{tag}>")
+
+    def handle_data(self, data: str) -> None:
+        if not self.skip_depth:
+            self.parts.write(html.escape(data, quote=False))
+
+    def handle_entityref(self, name: str) -> None:
+        if not self.skip_depth:
+            self.parts.write(f"&{name};")
+
+    def handle_charref(self, name: str) -> None:
+        if not self.skip_depth:
+            self.parts.write(f"&#{name};")
+
+    def _write_tag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
+        self.parts.write(
+            f"<{tag}"
+            + "".join(
+                f' {name}="{html.escape(value or "", quote=True)}"'
+                for name, value in attrs
+                if value is not None
+            )
+            + ">"
+        )
+
+    def html(self) -> str:
+        return self.parts.getvalue()
+
+
+def _materialized_image_candidate(value: object) -> tuple[str, str] | None:
+    if isinstance(value, str) and value:
+        return value, ""
+    if isinstance(value, (tuple, list)) and len(value) == 2:
+        url, descriptor = value
+        if isinstance(url, str) and isinstance(descriptor, str) and url:
+            return url, descriptor
+    return None
+
+
+def materialize_image_placeholders(
+    safe_html: str, resource_urls: Mapping[str, object]
+) -> str:
+    """Replace inert image placeholders with local, already-authorized URLs."""
+
+    if not safe_html:
+        return safe_html
+    materializer = _ImageMaterializer(resource_urls)
+    materializer.feed(safe_html)
+    materializer.close()
+    result = materializer.html()
+    if len(result.encode("utf-8")) > MAX_OUTPUT_BYTES:
+        raise HtmlSizeLimitError("materialized HTML exceeds the safe output limit")
+    return result
+
+
+def _parse_srcset(value: str) -> tuple[tuple[str, str], ...]:
+    """Parse the small, safe subset of srcset used by email HTML.
+
+    A data URI contains one comma itself, so this deliberately tokenizes it
+    before treating later commas as candidate separators.  Invalid candidates
+    are discarded by _classify_image_source.
+    """
+
+    result: list[tuple[str, str]] = []
+    position = 0
+    length = len(value)
+    while position < length:
+        while position < length and value[position] in " \t\r\n,":
+            position += 1
+        if position >= length:
+            break
+        start = position
+        if value[position : position + 5].casefold() == "data:":
+            while position < length and value[position] not in " \t\r\n":
+                position += 1
+        else:
+            while position < length and value[position] not in " \t\r\n,":
+                position += 1
+        source = value[start:position]
+        while position < length and value[position] in " \t\r\n":
+            position += 1
+        descriptor_start = position
+        while position < length and value[position] != ",":
+            position += 1
+        descriptor = value[descriptor_start:position].strip()
+        if descriptor and not re.fullmatch(r"(?:\d+(?:\.\d+)?x|\d+w)", descriptor):
+            descriptor = ""
+        if source:
+            result.append((source, descriptor))
+        if position < length:
+            position += 1
+    return tuple(result)
+
+
+def _classify_image_source(value: str) -> tuple[str, str] | None:
+    normalized = "".join(
+        character for character in value.strip() if ord(character) >= 0x20
+    )
+    if not normalized or len(normalized) > 16_384 or "\\" in normalized:
+        return None
+    lowered = normalized.casefold()
+    if lowered.startswith("cid:"):
+        content_id = normalized[4:].strip().strip("<>")
+        return ("cid", content_id.casefold()) if content_id else None
+    if lowered.startswith("data:"):
+        match = re.fullmatch(
+            r"data:(image/(?:png|jpeg|gif|webp));base64,([A-Za-z0-9+/=\s]+)",
+            normalized,
+            re.IGNORECASE,
+        )
+        if match is None:
+            return None
+        try:
+            decoded = base64.b64decode(
+                re.sub(r"\s+", "", match.group(2)), validate=True
+            )
+        except (ValueError, TypeError):
+            return None
+        if not decoded or len(decoded) > 8 * 1024 * 1024:
+            return None
+        canonical = match.group(1).lower()
+        encoded = base64.b64encode(decoded).decode("ascii")
+        return "data", f"data:{canonical};base64,{encoded}"
+    if normalized.startswith("//"):
+        normalized = "https:" + normalized
+    if re.match(r"https?://", normalized, re.IGNORECASE):
+        return ("remote", _safe_http_url(normalized)) if _safe_http_url(normalized) else None
+    # Content-Location can provide the base for this later.  It must never be
+    # used as a browser URL directly.
+    if normalized.startswith(("/", "./", "../")) or re.fullmatch(
+        r"[A-Za-z0-9][A-Za-z0-9._~!$&'()*+,;=:@%/?#-]{0,4095}", normalized
+    ):
+        return "location", normalized
+    return None
 
 
 def _is_tracking_image(attributes: dict[str, str]) -> bool:
@@ -838,6 +1128,7 @@ __all__ = [
     "MAX_OUTPUT_BYTES",
     "HtmlSanitizationError",
     "HtmlSizeLimitError",
+    "HtmlImageReference",
     "SanitizedEmailHtml",
     "normalize_plain_text",
     "sanitize_email_html",

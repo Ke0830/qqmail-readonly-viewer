@@ -1,5 +1,9 @@
+import base64
+import io
 import unittest
 from unittest.mock import patch
+
+from PIL import Image
 
 from mail_html import MAX_INPUT_BYTES, MAX_OUTPUT_BYTES
 from qqmail_viewer import QQMailClient, ViewerError
@@ -266,10 +270,47 @@ class RichTextImapSectionTests(unittest.TestCase):
 
         self.assertEqual(detail.body_format, "html")
         self.assertGreaterEqual(detail.blocked_images, 1)
+        self.assertEqual(
+            detail.image_resources,
+            (
+                {
+                    "id": "r1",
+                    "source_type": "cid",
+                    "source": "logo@example",
+                    "descriptor": "",
+                    "section": "2",
+                    "content_type": "image/png",
+                    "encoding": "base64",
+                    "octets": 500,
+                },
+            ),
+        )
         self.assertNotIn("cid:logo@example", detail.safe_html)
         self.assertIn("Logo", detail.safe_html)
         self._assert_queries(connection, ["(BODY.PEEK[1])"])
         self.assertNotIn("(BODY.PEEK[2])", connection.queries)
+
+    def test_explicit_inline_image_fetch_uses_only_its_selected_section(self):
+        output = io.BytesIO()
+        Image.new("RGB", (1, 1), (1, 2, 3)).save(output, format="PNG")
+        png = output.getvalue()
+        connection = _RecordingIMAP(
+            PLAIN,
+            {"(BODY.PEEK[2])": base64.b64encode(png)},
+        )
+        image = self._client(connection).fetch_inline_image(
+            "7",
+            {
+                "section": "2",
+                "content_type": "image/png",
+                "encoding": "base64",
+                "octets": len(base64.b64encode(png)),
+            },
+        )
+        self.assertEqual(image.mime_type, "image/png")
+        self.assertEqual(image.dimensions, (1, 1))
+        self.assertEqual(connection.queries, ["(BODY.PEEK[2])"])
+        self.assertNotIn("(BODY.PEEK[])", connection.queries)
 
     def test_mixed_body_never_fetches_attachment_payload(self):
         structure = _multipart(

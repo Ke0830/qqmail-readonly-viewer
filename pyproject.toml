@@ -11,6 +11,7 @@ requires-python = ">=3.10"
 dependencies = [
   "cryptography>=42",
   "nh3>=0.2.18",
+  "Pillow>=10",
   "tinycss2>=1.2",
   "keyring>=25; sys_platform == 'win32'",
 ]
@@ -32,4 +33,4 @@ classifiers = [
 qqmail-viewer = "qqmail_viewer:main"
 
 [tool.setuptools]
-py-modules = ["qqmail_viewer", "mail_cache", "mail_html", "mail_mime", "mail_sync"]
+py-modules = ["qqmail_viewer", "mail_cache", "mail_html", "mail_images", "mail_mime", "mail_sync"]
